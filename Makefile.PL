@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 #   Perl Makefile for Danga-Socket
-#   $Id$
+#   $Id: Makefile.PL 289 2006-06-12 10:10:17Z marksmith $
 #
 #   Invoke with 'perl Makefile.PL'
 #
