@@ -3,6 +3,8 @@ use strict;
 use fields ('psock',              # socket for parent/child communications
             'last_bcast_state',   # "{device|host}-$devid" => [$time, {alive|dead}]
             'readbuf',            # unparsed data from parent
+            'monitor_has_run',    # true once we've heard of the monitor job being alive
+            'last_ping',          # time we last said we're alive
             );
 
 use MogileFS::Util qw(error);
@@ -18,6 +20,8 @@ sub new {
     $self->{psock}            = $psock;
     $self->{readbuf}          = '';
     $self->{last_bcast_state} = {};
+    $self->{monitor_has_run}  = 0;
+    $self->{last_ping}        = 0;
 
     IO::Handle::blocking($psock, 0);
     return $self;
@@ -31,11 +35,20 @@ sub get_dbh {
     return Mgd::get_dbh();
 }
 
+sub monitor_has_run {
+    my $self = shift;
+    return $self->{monitor_has_run} ? 1 : 0;
+}
+
 # method that workers can call just to write something to the parent, so worker
 # doesn't get killed.  (during idle/slow operation, say)
 sub still_alive {
     my $self = shift;
-    $self->send_to_parent(":still_alive");  # a no-op, just for the watchdog
+    my $now = time();
+    if ($now > $self->{last_ping}) {
+        $self->send_to_parent(":still_alive");  # a no-op, just for the watchdog
+        $self->{last_ping} = $now;
+    }
 }
 
 sub send_to_parent {
@@ -45,7 +58,7 @@ sub send_to_parent {
     my $rv = syswrite($self->{psock}, $write);
     return 1 if $rv == $totallen;
     die "Error writing: $!" if $!;
-    
+
     my $remain = $totallen - $rv;
     my $offset = $rv;
     my $rout = '';
@@ -81,7 +94,7 @@ sub read_from_parent {
         my $buf;
         my $rv = sysread($psock, $buf, 1024);
         $self->{readbuf} .= $buf;
-        
+
         while ($self->{readbuf} =~ s/^(.+?)\r?\n//) {
             my $line = $1;
 
@@ -147,6 +160,12 @@ sub _broadcast_state {
     }
 }
 
+sub invalidate_meta {
+    my ($self, $what) = @_;
+    return if $Mgd::INVALIDATE_NO_PROPOGATE;  # anti recursion
+    $self->send_to_parent(":invalidate_meta $what");
+}
+
 # tries to parse generic (not job-specific) commands sent from parent
 # to child.  returns 1 on success, or 0 if comman given isn't generic,
 # and child should parse.
@@ -171,6 +190,22 @@ sub process_generic_command {
         return 1;
     }
 
+    if ($$lineref =~ /^:invalidate_meta_once (\w+)/) {
+        local $Mgd::INVALIDATE_NO_PROPOGATE = 1;
+        eval("Mgd::invalidate_${1}_cache()");
+        return 1;
+    }
+
+    if ($$lineref =~ /^:monitor_has_run/) {
+        $self->{monitor_has_run} = 1;
+        return 1;
+    }
+
+    if ($$lineref =~ /^:set_config_from_parent (\S+) (.+)/) {
+        # the 'no_broadcast' API keeps us from looping forever.
+        MogileFS::Config->set_config_no_broadcast($1, $2);
+        return 1;
+    }
     # TODO: warn on unknown commands?
 
     return 0;
