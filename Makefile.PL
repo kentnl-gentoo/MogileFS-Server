@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 #   Perl Makefile for Danga-Socket
-#   $Id: Makefile.PL 395 2006-09-25 17:35:30Z bradfitz $
+#   $Id: Makefile.PL 398 2006-09-25 17:47:57Z bradfitz $
 #
 #   Invoke with 'perl Makefile.PL'
 #
@@ -11,13 +11,13 @@
 
 use ExtUtils::MakeMaker;
 
-my $exefiles = ["mogstored", "mogilefsd"];
+my $exefiles = ["mogstored", "mogilefsd", "mogdbsetup", "mogautomount"];
 $exefiles = ["mogstored"] if exists $ENV{DANGABUILD_MOGSTOREDONLY};
 $exefiles = ["mogilefsd"] if exists $ENV{DANGABUILD_MOGILEFSDONLY};
 
 WriteMakefile(
     NAME                    => 'mogilefs-server',
-    VERSION                 => '2.00_02',
+    VERSION                 => '2.00_03',
     AUTHOR                  => 'Brad Fitzpatrick <brad@danga.com>',
     ABSTRACT                => 'MogileFS server components',
     EXE_FILES               => $exefiles,
