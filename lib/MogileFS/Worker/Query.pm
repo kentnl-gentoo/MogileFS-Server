@@ -53,14 +53,21 @@ sub work {
 
         my $newread;
         my $rv = sysread($psock, $newread, 1024);
+        if (!$rv) {
+            if (defined $rv) {
+                die "While reading pipe from parent, got EOF.  Parent's gone.  Quitting.\n";
+            } else {
+                die "Error reading pipe from parent: $!\n";
+            }
+        }
         $buf .= $newread;
 
         while ($buf =~ s/^(.+?)\r?\n//) {
             my $line = $1;
-            $self->validate_dbh;
             if ($self->process_generic_command(\$line)) {
                 $self->still_alive;  # no-op for watchdog
             } else {
+                $self->validate_dbh;
                 $self->process_line(\$line);
             }
         }
@@ -79,8 +86,7 @@ sub process_line {
     my ($client_ip, $line) = ($2, $3);
 
     # set global variables for zone determination
-    Mgd::set_client_ip($client_ip);
-    Mgd::set_force_altzone(0);
+    local $MogileFS::REQ_client_ip = $client_ip;
 
     # fallback to normal command handling
     if ($line =~ /^(\w+)\s*(.*)/) {
@@ -92,13 +98,40 @@ sub process_line {
         my $cmd_handler = *{"cmd_$cmd"}{CODE};
         if ($cmd_handler) {
             my $args = decode_url_args(\$args);
-            Mgd::set_force_altzone(1) if $args->{zone} && $args->{zone} eq 'alt';
+            local $MogileFS::REQ_altzone = ($args->{zone} && $args->{zone} eq 'alt');
             $cmd_handler->($self, $args);
             return;
         }
     }
 
     return $self->err_line('unknown_command');
+}
+
+# this is a half-finished command.  in particular, errors tend to
+# crash the parent or child or something.  it's a quick hack for a quick
+# ops task that needs done.  note in particular how it reaches across
+# package boundaries into an API that the Replicator probably doesn't
+# want exposed.
+sub cmd_httpcopy {
+    my MogileFS::Worker::Query $self = shift;
+    my $args = shift;
+    my $sdevid = $args->{sdevid};
+    my $ddevid = $args->{ddevid};
+    my $fid    = $args->{fid};
+
+    my $err;
+    my $rv = MogileFS::Worker::Replicate::http_copy(sdevid => $sdevid,
+                                                    ddevid => $ddevid,
+                                                    fid    => $fid,
+                                                    errref => \$err);
+    if ($rv) {
+        my $dfid = MogileFS::DevFID->new($ddevid, $fid);
+        $dfid->add_to_db
+            or return $self->err_line("copy_err", "failed to add link to database");
+        return $self->ok_line;
+    } else {
+        return $self->err_line("copy_err", $err);
+    }
 }
 
 # returns 0 on error, or dmid of domain
@@ -109,7 +142,7 @@ sub check_domain {
     return $self->err_line("no_domain") unless length($args->{domain});
 
     # validate domain
-    my $dmid = Mgd::domain_id($args->{domain}) or
+    my $dmid = MogileFS::Domain->id_of_name($args->{domain}) or
         return $self->err_line("unreg_domain");
 
     return $dmid;
@@ -126,10 +159,10 @@ sub cmd_clear_cache {
     my MogileFS::Worker::Query $self = shift;
     my $args = shift;
 
-    Mgd::invalidate_device_cache()  if $args->{devices} || $args->{all};
-    Mgd::invalidate_host_cache()    if $args->{hosts}   || $args->{all};
-    Mgd::invalidate_class_cache()   if $args->{class}   || $args->{all};
-    Mgd::invalidate_domain_cache()  if $args->{domain}  || $args->{all};
+    MogileFS::Device->invalidate_cache if $args->{devices} || $args->{all};
+    MogileFS::Host->invalidate_cache   if $args->{hosts}   || $args->{all};
+    MogileFS::Class->invalidate_cache  if $args->{class}   || $args->{all};
+    MogileFS::Domain->invalidate_cache if $args->{domain}  || $args->{all};
 
     return $self->ok_line;
 }
@@ -149,27 +182,34 @@ sub cmd_create_open {
     my $dmid = $args->{dmid};
     my $key = $args->{key} || "";
     my $multi = $args->{multi_dest} ? 1 : 0;
-    my $fid = ($args->{fid} + 0) || undef; # we want it to be undef if they didn't give one
-                                           # and we want to force it numeric...
+
+    # optional profiling of stages, if $args->{debug_profile}
+    my @profpoints;  # array of [point,hires-starttime]
+    my $profstart = sub {
+        my $pt = shift;
+        push @profpoints, [$pt, Time::HiRes::time()];
+    };
+    $profstart = sub {} unless $args->{debug_profile};
+    $profstart->("begin");
+
+    # we want it to be undef if not explicit, else force to numeric
+    my $exp_fidid = $args->{fid} ? int($args->{fid}) : undef;
 
     # get DB handle
-    my $dbh = Mgd::get_dbh() or
-        return $self->err_line("nodb");
+    my $sto = Mgd::get_store();
 
     # figure out what classid this file is for
     my $class = $args->{class} || "";
     my $classid = 0;
     if (length($class)) {
-        # TODO: cache this
-        $classid = $dbh->selectrow_array("SELECT classid FROM class ".
-                                         "WHERE dmid=? AND classname=?",
-                                         undef, $dmid, $class)
+        $classid = MogileFS::Class->class_id($dmid, $class)
             or return $self->err_line("unreg_class");
     }
 
     # if we haven't heard from the monitoring job yet, we need to chill a bit
     # to prevent a race where we tell a user that we can't create a file when
     # in fact we've just not heard from the monitor
+    $profstart->("wait_monitor");
     while (! $self->monitor_has_run) {
         $self->read_from_parent;
         $self->still_alive;
@@ -178,90 +218,74 @@ sub cmd_create_open {
 
     # find a device to put this file on that has 100Mb free.
     my (@dests, @hosts);
-    my $devs = Mgd::get_device_summary();
 
+    $profstart->("find_deviceid");
     while (scalar(@dests) < ($multi ? 3 : 1)) {
-        my $devid = Mgd::find_deviceid(
-                                       random           => 1,
-                                       must_be_writeable => 1,
-                                       weight_by_free   => 1,
-                                       not_on_hosts     => \@hosts,
-                                       );
+        my $devid = MogileFS::Device->find_deviceid(
+                                                    random           => 1,
+                                                    must_be_writeable => 1,
+                                                    weight_by_free   => 1,
+                                                    not_on_hosts     => \@hosts,
+                                                    );
         last unless defined $devid;
 
+        my $ddev = MogileFS::Device->of_devid($devid);
         push @dests, $devid;
-        push @hosts, $devs->{$devid}->{hostid};
+        push @hosts, $ddev->hostid;
     }
     return $self->err_line("no_devices") unless @dests;
 
-    my $explicit_fid_used = $fid ? 1 : 0;
-    # setup the new mapping.  we store the devices that we picked for
-    # this file in here, knowing that they might not be used.  create_close
-    # is responsible for actually mapping in file_on.  NOTE: fid is being
-    # passed in, it's either some number they gave us, or it's going to be
-    # undef which translates into NULL which means to automatically create
-    # one.  that should be fine.
-    my $ins_tempfile = sub {
-        $dbh->do("INSERT INTO tempfile SET ".
-                 " fid=?, dmid=?, dkey=?, classid=?, createtime=UNIX_TIMESTAMP(), devids=?",
-                 undef, $fid, $dmid, $key, $classid, join(',', @dests));
-        return undef if $dbh->err;
-        unless (defined $fid) {
-            # if they did not give us a fid, then we want to grab the one that was
-            # theoretically automatically generated
-            $fid = $dbh->{mysql_insertid};  # FIXME: mysql-ism
-        }
-        return undef unless defined $fid && $fid > 0;
-        return 1;
-    };
+    my $fidid = $sto->register_tempfile(
+                                        fid     => $exp_fidid, # may be undef/NULL to mean auto-increment
+                                        dmid    => $dmid,
+                                        key     => $key,
+                                        classid => $classid,
+                                        devids  => join(',', @dests),
+                                        );
 
-    return undef unless $ins_tempfile->();
-
-    my $fid_in_use = sub {
-        my $exists = $dbh->selectrow_array("SELECT COUNT(*) FROM file WHERE fid=?", undef, $fid);
-        die if $dbh->err;
-        return $exists ? 1 : 0;
-    };
-
-    # if the fid is in use, do something
-    while ($fid_in_use->($fid)) {
-        return $self->err_line("fid_in_use") if $explicit_fid_used;
-
-        # mysql could have been restarted with an empty tempfile table, causing
-        # innodb to reuse a fid number.  so we need to seed the tempfile table...
-
-        # get the highest fid from the filetable and insert a dummy row
-        $fid = $dbh->selectrow_array("SELECT MAX(fid) FROM file");
-        $ins_tempfile->();
-
-        # then do a normal auto-increment
-        $fid = undef;
-        return undef unless $ins_tempfile->();
-    }
+    return $self->err_line("db") unless $fidid;
+    return $self->err_line("fid_in_use") if $fidid == -1;
 
     # make sure directories exist for client to be able to PUT into
     foreach my $devid (@dests) {
-        my $path = Mgd::make_path($devid, $fid);
-        Mgd::vivify_directories($path);
+        $profstart->("vivify_dir_on_dev$devid");
+        my $dfid = MogileFS::DevFID->new($devid, $fidid);
+        $dfid->vivify_directories;
     }
 
-    # original single path support
-    return $self->ok_line({
-        fid => $fid,
-        devid => $dests[0],
-        path => Mgd::make_path($dests[0], $fid),
-    }) unless $multi;
+    $profstart->("end");
 
-    # multiple path support
-    my $ct = 0;
-    my $res = {};
-    foreach my $devid (@dests) {
-        $ct++;
-        $res->{"devid_$ct"} = $devid;
-        $res->{"path_$ct"} = Mgd::make_path($devid, $fid);
+    # common reply variables
+    my $res = {
+        fid => $fidid,
+    };
+
+    # add profiling data
+    if (@profpoints) {
+        $res->{profpoints} = 0;
+        for (my $i=0; $i<$#profpoints; $i++) {
+            my $ptnum = ++$res->{profpoints};
+            $res->{"prof_${ptnum}_name"} = $profpoints[$i]->[0];
+            $res->{"prof_${ptnum}_time"} =
+                sprintf("%0.03f",
+                        $profpoints[$i+1]->[1] - $profpoints[$i]->[1]);
+        }
     }
-    $res->{fid} = $fid;
-    $res->{dev_count} = $ct;
+
+    # add path info
+    if ($multi) {
+        my $ct = 0;
+        foreach my $devid (@dests) {
+            $ct++;
+            $res->{"devid_$ct"} = $devid;
+            $res->{"path_$ct"} = MogileFS::DevFID->new($devid, $fidid)->url;
+        }
+        $res->{dev_count} = $ct;
+    } else {
+        $res->{devid} = $dests[0];
+        $res->{path}  = MogileFS::DevFID->new($res->{devid}, $fidid)->url;
+    }
+
     return $self->ok_line($res);
 }
 
@@ -277,15 +301,17 @@ sub cmd_create_close {
     MogileFS::run_global_hook('cmd_create_close', $args);
 
     # late validation of parameters
-    my $dmid = $args->{dmid};
-    my $key = $args->{key};
-    my $fid = $args->{fid} or return $self->err_line("no_fid");
-    my $devid = $args->{devid} or return $self->err_line("no_devid");
-    my $path = $args->{path} or return $self->err_line("no_path");
+    my $dmid  = $args->{dmid};
+    my $key   = $args->{key};
+    my $fid   = $args->{fid}    or return $self->err_line("no_fid");
+    my $devid = $args->{devid}  or return $self->err_line("no_devid");
+    my $path  = $args->{path}   or return $self->err_line("no_path");
+
+    my $dfid = MogileFS::DevFID->new($devid, $fid);
 
     # is the provided path what we'd expect for this fid/devid?
     return $self->err_line("bogus_args")
-        unless $path eq Mgd::make_path($devid, $fid);
+        unless $path eq $dfid->url;
 
     # get DB handle
     my $dbh = Mgd::get_dbh() or
@@ -307,15 +333,20 @@ sub cmd_create_close {
     }
 
     # see if we have a fid for this key already
-    my $old_file = Mgd::key_filerow($dbh, $dmid, $key);
-    if ($old_file) {
+    my $old_fid = MogileFS::FID->new_from_dmid_and_key($dmid, $key);
+    if ($old_fid) {
         # add to to-delete list
-        $dbh->do("REPLACE INTO file_to_delete SET fid=?", undef, $old_file->{fid});
-        $dbh->do("DELETE FROM file WHERE fid=?", undef, $old_file->{fid});
+        $dbh->do("REPLACE INTO file_to_delete SET fid=?", undef, $old_fid->id);
+        $dbh->do("DELETE FROM file WHERE fid=?", undef, $old_fid->id);
     }
 
     # get size of file and verify that it matches what we were given, if anything
-    my $size = Mgd::get_file_size($path);
+    my $size = MogileFS::HTTPFile->at($path)->size;
+
+    if ($args->{size} > 0 && $size == 0) {
+        my $lasterr = MogileFS::Util::last_error();
+        return $self->err_line("size_verify_error", "Expected: $args->{size}; actual: 0 (error); path: $path; error: $lasterr")
+    }
 
     return $self->err_line("size_mismatch", "Expected: $args->{size}; actual: $size; path: $path")
         if $args->{size} && ($args->{size} != $size);
@@ -341,7 +372,9 @@ sub cmd_create_close {
 
     $dbh->do("DELETE FROM tempfile WHERE fid=?", undef, $fid);
 
-    if (Mgd::update_fid_devcount($fid)) {
+    my $fido = MogileFS::FID->new($fid);
+
+    if ($fido->update_devcount) {
         # call the hook - if this fails, we need to back the file out
         my $rv = MogileFS::run_global_hook('file_stored', $args);
         if (defined $rv && ! $rv) { # undef = no hooks, 1 = success, 0 = failure
@@ -422,8 +455,8 @@ sub cmd_list_fids {
         $ct++;
         my $r = $rows->{$fid};
         $ret->{"fid_${ct}_fid"} = $fid;
-        $ret->{"fid_${ct}_domain"} = ($domains{$r->{dmid}} ||= Mgd::domain_name($r->{dmid}));
-        $ret->{"fid_${ct}_class"} = ($classes{$r->{dmid}}{$r->{classid}} ||= Mgd::class_name($r->{dmid}, $r->{classid}));
+        $ret->{"fid_${ct}_domain"} = ($domains{$r->{dmid}} ||= MogileFS::Domain->name_of_id($r->{dmid}));
+        $ret->{"fid_${ct}_class"} = ($classes{$r->{dmid}}{$r->{classid}} ||= MogileFS::Class->class_name($r->{dmid}, $r->{classid}));
         $ret->{"fid_${ct}_key"} = $r->{dkey};
         $ret->{"fid_${ct}_length"} = $r->{length};
         $ret->{"fid_${ct}_devcount"} = $r->{devcount};
@@ -440,25 +473,28 @@ sub cmd_list_keys {
     my $dmid = $self->check_domain($args)
         or return $self->err_line('domain_not_found');
     my ($prefix, $after, $limit) = ($args->{prefix}, $args->{after}, $args->{limit});
-    return $self->err_line("no_key") unless $prefix;
 
-    # now validate that after matches prefix
-    return $self->err_line('after_mismatch')
-        if $after && $after !~ /^$prefix/;
+    if ($prefix) {
+        # now validate that after matches prefix
+        return $self->err_line('after_mismatch')
+            if $after && $after !~ /^$prefix/;
 
-    # verify there are no % or \ characters
-    return $self->err_line('invalid_chars')
-        if $prefix =~ /[%\\]/;
+        # verify there are no % or \ characters
+        return $self->err_line('invalid_chars')
+            if $prefix =~ /[%\\]/;
 
-    # escape underscores
-    $prefix =~ s/_/\\_/g;
+        # escape underscores
+        $prefix =~ s/_/\\_/g;
+    }
 
     # now fix the input... prefix always ends with a % so that it works
     # in a LIKE call, and after is either blank or something
+    $prefix ||= '';
     $prefix .= '%';
     $after ||= '';
     $limit ||= 1000;
     $limit += 0;
+    $limit = 1000 if $limit > 1000;
 
     # get DB handle
     my $dbh = Mgd::get_dbh() or
@@ -510,19 +546,18 @@ sub cmd_get_hosts {
     my MogileFS::Worker::Query $self = shift;
     my $args = shift;
 
-    Mgd::check_host_cache();
+    MogileFS::Host->invalidate_cache;
 
     my $ret = { hosts => 0 };
-    while (my ($hostid, $row) = each %Mgd::cache_host) {
-        next if defined $args->{hostid} && $hostid != $args->{hostid};
-
-        $ret->{hosts}++;
-        while (my ($key, $val) = each %$row) {
-            # ignore things such as the netmask object
-            next if ref $val;
-
+    foreach my $host (MogileFS::Host->hosts) {
+        next if defined $args->{hostid} && $host->id != $args->{hostid};
+        my $n = ++$ret->{hosts};
+        foreach my $key (qw(hostid status hostname hostip
+                            http_port http_get_port
+                            altip altmask))
+        {
             # must be regular data so copy it in
-            $ret->{"host$ret->{hosts}_$key"} = $val;
+            $ret->{"host${n}_$key"} = $host->field($key);
         }
     }
 
@@ -533,15 +568,14 @@ sub cmd_get_devices {
     my MogileFS::Worker::Query $self = shift;
     my $args = shift;
 
-    my $devs = Mgd::get_device_summary();
-
     my $ret = { devices => 0 };
-    while (my ($devid, $row) = each %$devs) {
-        next if defined $args->{devid} && $devid != $args->{devid};
+    foreach my $dev (MogileFS::Device->devices) {
+        next if defined $args->{devid} && $dev->id != $args->{devid};
+        my $n = ++$ret->{devices};
 
-        $ret->{devices}++;
-        while (my ($key, $val) = each %$row) {
-            $ret->{"dev$ret->{devices}_$key"} = $val;
+        my $sum = $dev->overview_hashref;
+        while (my ($key, $val) = each %$sum) {
+            $ret->{"dev${n}_$key"} = $val;
         }
     }
 
@@ -551,7 +585,6 @@ sub cmd_get_devices {
 sub cmd_create_device {
     my MogileFS::Worker::Query $self = shift;
     my $args = shift;
-    my $devs = Mgd::get_device_summary();
 
     my $dbh = Mgd::get_dbh()
         or return $self->err_line("nodb");
@@ -563,13 +596,15 @@ sub cmd_create_device {
     return $self->err_line("invalid_devid") unless $devid && $devid =~ /^\d+$/;
 
     my $hostid;
-    Mgd::check_host_cache();
+    MogileFS::Host->check_cache;
     if ($args->{hostid} && $args->{hostid} =~ /^\d+$/) {
         $hostid = $args->{hostid};
-        return $self->err_line("unknown_hostid") unless $Mgd::cache_host{$hostid};
-    } elsif (my $host = $args->{hostname}) {
-        $hostid = Mgd::host_id($host);
-        return $self->err_line("unknown_host") unless $hostid;
+        my $host = MogileFS::Host->of_hostid($hostid);
+        return $self->err_line("unknown_hostid") unless $host && $host->exists;
+    } elsif (my $hname = $args->{hostname}) {
+        my $host = MogileFS::Host->of_hostname($hname);
+        return $self->err_line("unknown_host") unless $host;
+        $hostid = $host->id;
     }
 
     $dbh->do("INSERT INTO device SET devid=?, hostid=?, status=?", undef,
@@ -577,7 +612,7 @@ sub cmd_create_device {
     if ($dbh->err) {
         return $self->err_line("existing_devid");
     }
-    Mgd::invalidate_device_cache();
+    MogileFS::Device->invalidate_cache;
     return $self->ok_line;
 }
 
@@ -593,7 +628,7 @@ sub cmd_create_domain {
 
     # FIXME: add some sort of authentication/limitation on this?
 
-    my $dmid = Mgd::domain_id($domain);
+    my $dmid = MogileFS::Domain->id_of_name($domain);
     return $self->err_line('domain_exists') if $dmid;
 
     # get the max domain id
@@ -603,7 +638,7 @@ sub cmd_create_domain {
     return $self->err_line('failure') if $dbh->err;
 
     # return the domain id we created
-    Mgd::invalidate_domain_cache();
+    MogileFS::Domain->invalidate_cache;
     return $self->ok_line({ domain => $domain });
 }
 
@@ -616,27 +651,28 @@ sub cmd_delete_domain {
 
     # FIXME: add some sort of authentication/limitation on this?
 
-    my $dmid = Mgd::domain_id($domain);
+    my $dmid = MogileFS::Domain->id_of_name($domain);
     return $self->err_line('domain_not_found') unless $dmid;
 
     # ensure it has no classes
-    my $classes = Mgd::hostid_classes($dmid);
+    my $classes = MogileFS::Class->dmid_classes($dmid);
     return $self->err_line('failure') unless $classes;
     return $self->err_line('domain_not_empty') if %$classes;
 
     # and ensure it has no files (fast: key based)
     my $dbh = Mgd::get_dbh()
         or return $self->err_line("nodb");
-    my $ct = $dbh->selectrow_array('SELECT COUNT(*) FROM file WHERE dmid = ?', undef, $dmid);
+    my $has_a_fid = $dbh->selectrow_array('SELECT fid FROM file WHERE dmid = ? LIMIT 1',
+                                          undef, $dmid);
     return $self->err_line('failure') if $dbh->err;
-    return $self->err_line('domain_has_files') if $ct;
+    return $self->err_line('domain_has_files') if $has_a_fid;
 
     # all clear, nuke it
     $dbh->do("DELETE FROM domain WHERE dmid = ?", undef, $dmid);
     return $self->err_line('failure') if $dbh->err;
 
     # return the domain we nuked
-    Mgd::invalidate_domain_cache();
+    MogileFS::Domain->invalidate_cache;
     return $self->ok_line({ domain => $domain });
 }
 
@@ -658,10 +694,10 @@ sub cmd_create_class {
 
     # FIXME: add some sort of authentication/limitation on this?
 
-    my $dmid = Mgd::domain_id($domain);
+    my $dmid = MogileFS::Domain->id_of_name($domain);
     return $self->err_line('no_domain') unless $dmid;
 
-    my $cid = Mgd::class_id($dmid, $class);
+    my $cid = MogileFS::Class->class_id($dmid, $class);
     if ($args->{update}) {
         return $self->err_line('class_not_found') if ! $cid;
     } else {
@@ -685,7 +721,7 @@ sub cmd_create_class {
     return $self->err_line('failure') if $dbh->err;
 
     # return success
-    Mgd::invalidate_class_cache();
+    MogileFS::Class->invalidate_cache;
     return $self->ok_line({ class => $class, mindevcount => $mindevcount, domain => $domain });
 }
 
@@ -709,25 +745,26 @@ sub cmd_delete_class {
 
     # FIXME: add some sort of authentication/limitation on this?
 
-    my $dmid = Mgd::domain_id($domain);
+    my $dmid = MogileFS::Domain->id_of_name($domain);
     return $self->err_line('domain_not_found') unless $dmid;
 
-    my $cid = Mgd::class_id($dmid, $class);
+    my $cid = MogileFS::Class->class_id($dmid, $class);
     return $self->err_line('class_not_found') unless $cid;
 
     # and ensure it has no files (fast: key based)
     my $dbh = Mgd::get_dbh()
         or return $self->err_line("nodb");
-    my $ct = $dbh->selectrow_array('SELECT COUNT(*) FROM file WHERE dmid = ? AND classid = ?', undef, $dmid, $cid);
+    my $has_a_fid = $dbh->selectrow_array('SELECT fid FROM file WHERE dmid = ? AND classid = ? LIMIT 1',
+                                          undef, $dmid, $cid);
     return $self->err_line('failure') if $dbh->err;
-    return $self->err_line('class_has_files') if $ct;
+    return $self->err_line('class_has_files') if $has_a_fid;
 
     # all clear, nuke it
     $dbh->do("DELETE FROM class WHERE dmid = ? AND classid = ?", undef, $dmid, $cid);
     return $self->err_line('failure') if $dbh->err;
 
     # return the class we nuked
-    Mgd::invalidate_class_cache();
+    MogileFS::Class->invalidate_cache;
     return $self->ok_line({ domain => $domain, class => $class });
 }
 
@@ -738,25 +775,26 @@ sub cmd_create_host {
     my $dbh = Mgd::get_dbh()
         or return $self->err_line("nodb");
 
-    my $host = $args->{host};
-    return $self->err_line('no_host') unless $host;
+    my $hostname = $args->{host};
+    return $self->err_line('no_host') unless $hostname;
 
     # unless update, require ip/port
     unless ($args->{update}) {
         return $self->err_line('no_ip') unless $args->{ip};
         return $self->err_line('no_port') unless $args->{port};
+        $args->{status} ||= 'down';
     }
 
-    $args->{status} ||= 'down';
     return $self->err_line('unknown_state')
         unless $args->{status} =~ /^(?:alive|down|dead)$/;
 
-    my $hid = Mgd::host_id($host);
+    my $host = MogileFS::Host->of_hostname($hostname);
     if ($args->{update}) {
-        return $self->err_line('host_not_found') if ! $hid;
+        return $self->err_line('host_not_found') if ! $host;
     } else {
-        return $self->err_line('host_exists') if $hid;
+        return $self->err_line('host_exists') if $host;
     }
+    my $hid = $host ? $host->id : 0;
 
     # update or insert at this point
     if ($args->{update}) {
@@ -764,7 +802,7 @@ sub cmd_create_host {
         # to the database columns, see if this argument was passed (so we don't
         # overwrite other things), and then quote the input and set it
         my %map = ( ip => 'hostip', port => 'http_port', getport => 'http_get_port',
-                    altip => 'altip', altmask => 'altmask', root => 'remoteroot',
+                    altip => 'altip', altmask => 'altmask',
                     status => 'status', );
         my $set = join(', ', map { $map{$_} . " = " . $dbh->quote($args->{$_}) }
                              grep { exists $args->{$_} }
@@ -777,17 +815,18 @@ sub cmd_create_host {
         $hid = ($dbh->selectrow_array('SELECT MAX(hostid) FROM host') || 0) + 1;
 
         # now insert the new host
-        $dbh->do("INSERT INTO host (hostid, status, http_port, http_get_port, hostname, hostip, altip, altmask, remoteroot) " .
-                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-                 undef, $hid, map { $args->{$_} } qw(status port getport host ip altip altmask root));
+        $dbh->do("INSERT INTO host (hostid, status, http_port, http_get_port, hostname, hostip, altip, altmask) " .
+                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                 undef, $hid, map { $args->{$_} } qw(status port getport host ip altip altmask));
     }
     return $self->err_line('failure') if $dbh->err;
 
     # force a host reload
-    Mgd::invalidate_host_cache();
+    MogileFS::Host->invalidate_cache;
+    $host = MogileFS::Host->of_hostid($hid);
 
     # return success
-    return $self->ok_line($Mgd::cache_host{$hid});
+    return $self->ok_line($host->overview_hashref);
 }
 
 sub cmd_update_host {
@@ -802,23 +841,24 @@ sub cmd_delete_host {
     my MogileFS::Worker::Query $self = shift;
     my $args = shift;
 
-    my $hostid = Mgd::host_id($args->{host})
+    my $host   = MogileFS::Host->of_hostname($args->{host})
         or return $self->err_line('unknown_host');
+
+    my $hostid = $host->id;
 
     my $dbh = Mgd::get_dbh()
         or return $self->err_line("nodb");
 
-    my $dsum = Mgd::get_device_summary();
-    foreach my $dev (values %$dsum) {
+    foreach my $dev (MogileFS::Device->devices) {
         return $self->err_line('host_not_empty')
-            if $dev->{hostid} == $hostid && $dev->{status} ne "dead";
+            if $dev->hostid == $hostid && $dev->status ne "dead";
     }
 
     my $res = $dbh->do("DELETE FROM host WHERE hostid = ?", undef, $hostid);
     return $self->err_line('failure')
         unless $res;
 
-    Mgd::invalidate_host_cache();
+    MogileFS::Host->invalidate_cache;
     return $self->ok_line;
 }
 
@@ -877,11 +917,11 @@ sub cmd_get_paths {
     my $dbh = Mgd::get_dbh() or
         return $self->err_line("nodb");
 
-    my $filerow = Mgd::key_filerow($dbh, $dmid, $key);
-    return $self->err_line("unknown_key") unless $filerow;
+    my $fid = MogileFS::FID->new_from_dmid_and_key($dmid, $key)
+        or return $self->err_line("unknown_key");
 
-    my $fid = $filerow->{fid};
-    my $dsum = Mgd::get_device_summary();
+    my $fidid = $fid->id;
+    my $dmap = MogileFS::Device->map;
 
     my $ret = {
         paths => 0,
@@ -889,24 +929,26 @@ sub cmd_get_paths {
 
     # is this fid still owned by this key?
     my $devids = $dbh->selectcol_arrayref("SELECT devid FROM file_on WHERE fid=?",
-                                          undef, $fid) || [];
+                                          undef, $fidid) || [];
 
     # randomly weight the devices
-    my @list = MogileFS::Util::weighted_list(map { [ $_, defined $dsum->{$_}->{weight} ?
-                                                     $dsum->{$_}->{weight} : 100 ] } @$devids);
+    my @list = MogileFS::Util::weighted_list(map { [ $_, defined $dmap->{$_}->weight ?
+                                                     $dmap->{$_}->weight : 100 ] } @$devids);
 
     # keep one partially-bogus path around just in case we have nothing else to send.
     my $backup_path;
 
     # construct result paths
     foreach my $devid (@list) {
-        my $dev = $dsum->{$devid};
-        next unless $dev && ($dev->{status} eq "alive" || $dev->{status} eq "readonly");
+        my $dev = $dmap->{$devid};
+        next unless $dev && ($dev->status eq "alive" || $dev->status eq "readonly");
 
-        my $path = Mgd::make_get_path($devid, $fid);
+        my $host = $dev->host;
+        next unless $dev && $host;
+        my $dfid = MogileFS::DevFID->new($dev, $fid);
+        my $path = $dfid->get_url;
         my $currently_down =
-            MogileFS->observed_state("host", $dev->{hostid}) eq "unreachable" ||
-            MogileFS->observed_state("device", $dev->{devid}) eq "unreachable";
+            $host->observed_unreachable || $dev->observed_unreachable;
 
         if ($currently_down) {
             $backup_path = $path;
@@ -917,7 +959,7 @@ sub cmd_get_paths {
         next unless
             $ret->{paths}        ||
             $args->{noverify}    ||
-            Mgd::get_file_size($path, $dev) == $filerow->{length};
+            $dfid->size_matches;
 
         my $n = ++$ret->{paths};
         $ret->{"path$n"} = $path;
@@ -962,7 +1004,7 @@ sub cmd_set_weight {
     return $self->err_line('failure') if $dbh->err;
 
     # success, weight changed
-    Mgd::invalidate_device_cache();
+    MogileFS::Device->invalidate_cache;
     return $self->ok_line($ret);
 }
 
@@ -999,7 +1041,7 @@ sub cmd_set_state {
     return $self->err_line('failure') if $dbh->err;
 
     # success, state changed
-    Mgd::invalidate_device_cache();
+    MogileFS::Device->invalidate_cache;
     return $self->ok_line($ret);
 }
 
@@ -1149,11 +1191,19 @@ sub cmd_checker {
     }
 
     if (defined $new_setting) {
-        Mgd::set_server_setting('fsck_enable', $new_setting);
+        MogileFS::Checker->set_server_setting('fsck_enable', $new_setting);
         return $self->ok_line;
     }
 
     $self->err_line('failure');
+}
+
+sub cmd_do_monitor_round {
+    my MogileFS::Worker::Query $self = shift;
+    my $args = shift;
+    $self->forget_that_monitor_has_run;
+    $self->wait_for_monitor;
+    return $self->ok_line;
 }
 
 sub ok_line {
@@ -1177,6 +1227,7 @@ sub ok_line {
 # second argument: optional error text.  text will be taken from code if no text provided.
 sub err_line {
     my MogileFS::Worker::Query $self = shift;
+
     my $err_code = shift;
     my $err_text = shift || {
         'after_mismatch' => "Pattern does not match the after-value?",
@@ -1211,7 +1262,7 @@ sub err_line {
         'unknown_host' => "Host not found",
         'unknown_state' => "Invalid/unknown state",
         'unreg_domain' => "Domain name invalid/not found",
-    }->{$err_code} || "no text";
+    }->{$err_code} || $err_code;
 
     my $delay = '';
     if ($self->{querystarttime}) {
@@ -1240,7 +1291,7 @@ sub decode_url_args
     my $ret = {};
 
     my $pair;
-    my @pairs = split(/&/, $$buffer);
+    my @pairs = grep { $_ } split(/&/, $$buffer);
     my ($name, $value);
     foreach $pair (@pairs)
     {

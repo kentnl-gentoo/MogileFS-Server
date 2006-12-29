@@ -29,8 +29,8 @@ sub replicate_to {
     my %on_dev;
     my %on_host;
     foreach my $dev (@$on_devs) {
-        $on_host{$dev->{hostid}} = 1;
-        $on_dev{$dev->{devid}} = 1;
+        $on_host{$dev->hostid} = 1;
+        $on_dev{$dev->id} = 1;
     }
     my $uniq_hosts_on    = scalar keys %on_host;
     my $total_uniq_hosts = unique_hosts($all_devs);
@@ -43,11 +43,11 @@ sub replicate_to {
     }
 
     my @good_devids = grep { ! $failed->{$_} && ! $on_dev{$_} }
-            Mgd::find_deviceid(
-                               random         => 1,
-                               not_on_hosts   => $not_on_hosts,
-                               weight_by_free => 1,
-                               );
+            MogileFS::Device->find_deviceid(
+                                            random         => 1,
+                                            not_on_hosts   => $not_on_hosts,
+                                            weight_by_free => 1,
+                                            );
 
     return undef unless @good_devids;
     return $good_devids[0];
@@ -58,8 +58,8 @@ sub unique_hosts {
     my %host;  # hostid -> 1
     foreach my $devid (keys %$devs) {
         my $dev = $devs->{$devid};
-        next unless $dev->{status} =~ /^alive|readonly$/;
-        $host{$dev->{hostid}}++;
+        next unless $dev->status =~ /^alive|readonly$/;
+        $host{$dev->hostid}++;
     }
     return scalar keys %host;
 }

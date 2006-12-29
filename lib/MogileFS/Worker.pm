@@ -40,6 +40,20 @@ sub monitor_has_run {
     return $self->{monitor_has_run} ? 1 : 0;
 }
 
+sub forget_that_monitor_has_run {
+    my $self = shift;
+    $self->{monitor_has_run} = 0;
+}
+
+sub wait_for_monitor {
+    my $self = shift;
+    while (! $self->monitor_has_run) {
+        $self->read_from_parent;
+        $self->still_alive;
+        sleep 1;
+    }
+}
+
 # method that workers can call just to write something to the parent, so worker
 # doesn't get killed.  (during idle/slow operation, say)
 sub still_alive {
@@ -90,9 +104,16 @@ sub read_from_parent {
     my $psock = $self->{psock};
 
     # while things are immediately available,
-    while (Mgd::wait_for_readability(fileno($psock), 0)) {
+    while (MogileFS::Util::wait_for_readability(fileno($psock), 0)) {
         my $buf;
         my $rv = sysread($psock, $buf, 1024);
+        if (!$rv) {
+            if (defined $rv) {
+                die "While reading pipe from parent, got EOF.  Parent's gone.  Quitting.\n";
+            } else {
+                die "Error reading pipe from parent: $!\n";
+            }
+        }
         $self->{readbuf} .= $buf;
 
         while ($self->{readbuf} =~ s/^(.+?)\r?\n//) {
@@ -149,7 +170,11 @@ sub broadcast_host_unreachable {
 
 sub _broadcast_state {
     my ($self, $what, $whatid, $state) = @_;
-    MogileFS->set_observed_state($what, $whatid, $state);
+    if ($what eq "host") {
+        MogileFS::Host->of_hostid($whatid)->set_observed_state($state);
+    } elsif ($what eq "device") {
+        MogileFS::Device->of_devid($whatid)->set_observed_state($state);
+    }
     my $key = "$what-$whatid";
     my $laststate = $self->{last_bcast_state}{$key};
     my $now = time();
@@ -175,8 +200,12 @@ sub process_generic_command {
     return 0 unless $$lineref =~ /^:/;  # all generic commands start with colon
 
     if ($$lineref =~ /^:state_change (\w+) (\d+) (\w+)/) {
-        # {"host"|"device"} <id> {"alive"|"dead"}
-        MogileFS->set_observed_state($1, $2, $3);
+        my ($what, $whatid, $state) = ($1, $2, $3);
+        if ($what eq "host") {
+            MogileFS::Host->of_hostid($whatid)->set_observed_state($state);
+        } elsif ($what eq "device") {
+            MogileFS::Device->of_devid($whatid)->set_observed_state($state);
+        }
         return 1;
     }
 

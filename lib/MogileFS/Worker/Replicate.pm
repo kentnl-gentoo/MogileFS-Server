@@ -8,14 +8,20 @@ use fields (
             );
 
 use List::Util ();
-use MogileFS::Util qw(error every);
+use MogileFS::Util qw(error every debug);
 use MogileFS::Class;
-use POSIX ":sys_wait_h"; # argument for waitpid
-use POSIX;
 
 # setup the value used in a 'nexttry' field to indicate that this item will never
 # actually be tried again and require some sort of manual intervention.
 use constant ENDOFTIME => 2147483647;
+
+# { fid => lastcheck }; instructs us not to replicate this fid... we will clear
+# out fids from this list that are expired
+my %fidfailure;
+
+# { fid => 1 }; used to keep track of fids we find in the unreachable_fids table
+my %unreachable;
+my $dbh;
 
 sub end_of_time { ENDOFTIME; }
 
@@ -35,6 +41,11 @@ sub process_line {
         return 1;
     }
 
+    if ($$lineref =~ /^repl_unreachable (\d+)/) {
+        $unreachable{$1} = 1;
+        return 1;
+    }
+
     # telnet to main port and do:
     #    !to replicate repl_compat {0,1}
     # to change it in realtime, without restarting.
@@ -48,14 +59,6 @@ sub process_line {
 
 # replicator wants
 sub watchdog_timeout { 30; }
-
-# { fid => lastcheck }; instructs us not to replicate this fid... we will clear
-# out fids from this list that are expired
-my %fidfailure;
-
-# { fid => 1 }; used to keep track of fids we find in the unreachable_fids table
-my %unreachable;
-my $dbh;
 
 sub work {
     my $self = shift;
@@ -223,8 +226,7 @@ sub replicate_using_devcounts {
         my $mclass = shift;
         my ($dmid, $classid, $min, $policy_class) = map { $mclass->$_ } qw(domainid classid mindevcount policy_class);
 
-        error("Checking replication for dmid=$dmid, classid=$classid, min=$min")
-            if $Mgd::DEBUG >= 1;
+        debug("Checking replication for dmid=$dmid, classid=$classid, min=$min");
 
         my $LIMIT = 1000;
 
@@ -248,8 +250,7 @@ sub replicate_using_devcounts {
 
             # see if we have any files to replicate
             my $count = $fids ? scalar @$fids : 0;
-            error("  found $count for dmid=$dmid/classid=$classid/min=$min")
-                if $Mgd::DEBUG >= 1;
+            debug("  found $count for dmid=$dmid/classid=$classid/min=$min");
             next unless $count;
 
             # randomize the list so multiple daemons/threads working on
@@ -257,7 +258,7 @@ sub replicate_using_devcounts {
             # same fids to move
             my @randfids = List::Util::shuffle(@$fids);
 
-            error("Need to replicate: $dmid/$classid: @$fids") if $Mgd::DEBUG >= 2;
+            debug("Need to replicate: $dmid/$classid: @$fids") if $Mgd::DEBUG >= 2;
             foreach my $fid (@randfids) {
                 # now replicate this fid
                 $attempted++;
@@ -291,7 +292,7 @@ sub replicate_using_devcounts {
                     $self->send_to_parent("repl_i_did $fid");
 
                     # status update
-                    if ($fixed % 20 == 0) {
+                    if ($Mgd::DEBUG >= 1 && $fixed % 20 == 0) {
                         my $ratio = $fixed/$attempted*100;
                         error(sprintf("replicated=$fixed, attempted=$attempted, ratio=%.2f%%", $ratio))
                             if $fixed % 20 == 0;
@@ -358,7 +359,7 @@ sub replicate {
     };
 
     # hashref of devid -> $device_row_href  (where devid is alive)
-    my $devs = Mgd::get_device_summary();
+    my $devs = MogileFS::Device->map;
     return $retunlock->(0, "no_devices", "Device information from get_device_summary is empty")
         unless $devs && %$devs;
 
@@ -366,31 +367,29 @@ sub replicate {
     return $retunlock->(0, "failed_getting_lock", "Unable to obtain lock $lockname")
         unless $lock;
 
-    # learn what devices this file is already on
-    my $on_count = 0;
-    my @dead_devid;   # list of dead devids.  FIXME: do something with this?
-    my @exist_devid;  # list of existing devids
+    # learn what this devices file is already on
+    my @on_devs;       # all devices fid is on, reachable or not.
+    my @dead_devid;    # list of dead devids.  FIXME: do something with this?
+    my @on_up_devid;   # subset of @on_devs:  just devs that are alive or readonly
 
     my $sth = $dbh->prepare("SELECT devid FROM file_on WHERE fid=?");
     $sth->execute($fid);
     die $dbh->errstr if $dbh->err;
-    my @on_devs;
     while (my ($devid) = $sth->fetchrow_array) {
         my $d = $devs->{$devid};
         push @on_devs, $d;
-        unless ($d && $d->{status} =~ /^alive|readonly$/) {
+        unless ($d && $d->status =~ /^alive|readonly$/) {
             push @dead_devid, $devid;
             next;
         }
-        $on_count++;
-        push @exist_devid, $devid;
+        push @on_up_devid, $devid;
     }
 
-    return $retunlock->(0, "no_source",   "Source is no longer available replicating $fid") if $on_count == 0;
-    return $retunlock->(0, "source_down", "No eligible devices available replicating $fid") if @exist_devid == 0;
+    return $retunlock->(0, "no_source",   "Source is no longer available replicating $fid") if @on_devs == 0;
+    return $retunlock->(0, "source_down", "No alive devices available replicating $fid") if @on_up_devid == 0;
 
     # if they requested a specific source, that source must be up.
-    if ($sdevid && ! grep { $_ == $sdevid} @exist_devid) {
+    if ($sdevid && ! grep { $_ == $sdevid} @on_up_devid) {
         return $retunlock->(0, "source_down", "Requested replication source device $sdevid not available");
     }
 
@@ -422,7 +421,7 @@ sub replicate {
 
         # replication policy shouldn't tell us to put a file on a
         # device that it's already on.  that's just stupid.
-        if (grep { $_->{devid} == $ddevid } @on_devs) {
+        if (grep { $_->id == $ddevid } @on_devs) {
             return $retunlock->(0, "policy_error_already_there",
                                 "replication policy told us to put fid $fid on dev $ddevid, but it's already there!");
         }
@@ -430,29 +429,21 @@ sub replicate {
         # find where we're replicating from
         unless ($fixed_source) {
             # TODO: use an observed good device+host as source to start.
-            my @choices = grep { ! $source_failed{$_} } @exist_devid;
+            my @choices = grep { ! $source_failed{$_} } @on_up_devid;
             return $retunlock->(0, "source_down", "No devices available replicating $fid") unless @choices;
             $sdevid = @choices[int(rand(scalar @choices))];
         }
 
-        my $rv = undef;
-        if (MogileFS::Config->http_mode) {
-            my $worker = MogileFS::ProcManager->is_child or die;
-            $rv = http_copy(
-                            sdevid       => $sdevid,
-                            ddevid       => $ddevid,
-                            fid          => $fid,
-                            expected_len => undef,  # FIXME: get this info to pass along
-                            errref       => \$copy_err,
-                            callback     => sub { $worker->still_alive; },
-                            );
-            die "Bogus error code" if !$rv && $copy_err !~ /^(?:src|dest)_error$/;
-        } else {
-            my $root = Mgd::mog_root();
-            my $dst_path = $root . "/" . make_path($ddevid, $fid);
-            my $src_path = $root . "/" . make_path($sdevid, $fid);
-            $rv = File::Copy::copy($src_path, $dst_path);
-        }
+        my $worker = MogileFS::ProcManager->is_child or die;
+        my $rv = http_copy(
+                           sdevid       => $sdevid,
+                           ddevid       => $ddevid,
+                           fid          => $fid,
+                           expected_len => undef,  # FIXME: get this info to pass along
+                           errref       => \$copy_err,
+                           callback     => sub { $worker->still_alive; },
+                           );
+        die "Bogus error code: $copy_err" if !$rv && $copy_err !~ /^(?:src|dest)_error$/;
 
         unless ($rv) {
             error("Failed copying fid $fid from devid $sdevid to devid $ddevid (error type: $copy_err)");
@@ -471,7 +462,9 @@ sub replicate {
             next;
         }
 
-        add_file_on($fid, $ddevid, 1);
+        my $dfid = MogileFS::DevFID->new($ddevid, $fid);
+        $dfid->add_to_db;
+
         push @on_devs, $devs->{$ddevid};
     }
 
@@ -512,17 +505,16 @@ sub http_copy {
 
     # handles setting unreachable magic; $error->(reachability, "message")
     my $error_unreachable = sub {
-        if ($_[0]) {
-            my $worker = MogileFS::ProcManager->is_child;
-            $worker->send_to_parent("repl_unreachable $fid");
+        my $worker = MogileFS::ProcManager->is_child;
+        $worker->send_to_parent(":repl_unreachable $fid");
 
-            # update database table
-            Mgd::validate_dbh();
-            my $dbh = Mgd::get_dbh();
-            $dbh->do("REPLACE INTO unreachable_fids VALUES ($fid, UNIX_TIMESTAMP())");
-        }
+        # update database table
+        Mgd::validate_dbh();
+        my $dbh = Mgd::get_dbh();
+        $dbh->do("REPLACE INTO unreachable_fids VALUES ($fid, UNIX_TIMESTAMP())");
+
         $$errref = "src_error" if $errref;
-        return error($_[1]);
+        return error("Fid $fid unreachable while replicating: $_[0]");
     };
 
     my $dest_error = sub {
@@ -538,18 +530,24 @@ sub http_copy {
     };
 
     # get some information we'll need
-    my $devs = Mgd::get_device_summary();
-    my ($sdev, $ddev) = ($devs->{$sdevid}, $devs->{$ddevid});
+    my $sdev = MogileFS::Device->of_devid($sdevid);
+    my $ddev = MogileFS::Device->of_devid($ddevid);
+
     return error("Error: unable to get device information: source=$sdevid, destination=$ddevid, fid=$fid")
-        unless ref $sdev && ref $ddev;
-    my ($spath, $dpath) = (Mgd::make_http_path($sdevid, $fid),
-                           Mgd::make_http_path($ddevid, $fid));
-    my ($shost, $sport) = (Mgd::hostid_ip($sdev->{hostid}), Mgd::hostid_http_port($sdev->{hostid}));
-    my ($dhost, $dport) = (Mgd::hostid_ip($ddev->{hostid}), Mgd::hostid_http_port($ddev->{hostid}));
-    unless (defined $spath && defined $dpath && defined $shost && defined $dhost && $sport && $dport) {
+        unless $sdev && $ddev && $sdev->exists && $ddev->exists;
+
+    my $s_dfid = MogileFS::DevFID->new($sdev, $fid);
+    my $d_dfid = MogileFS::DevFID->new($ddev, $fid);
+
+    my ($spath, $dpath) = (map { $_->uri_path } ($s_dfid, $d_dfid));
+    my ($shost, $dhost) = (map { $_->host     } ($sdev, $ddev));
+
+    my ($shostip, $sport) = ($shost->ip, $shost->http_port);
+    my ($dhostip, $dport) = ($dhost->ip, $dhost->http_port);
+    unless (defined $spath && defined $dpath && defined $shostip && defined $dhostip && $sport && $dport) {
         # show detailed information to find out what's not configured right
         error("Error: unable to replicate file fid=$fid from device id $sdevid to device id $ddevid");
-        error("       http://$shost:$sport$spath -> http://$dhost:$dport$dpath");
+        error("       http://$shostip:$sport$spath -> http://$dhostip:$dport$dpath");
         return 0;
     }
 
@@ -558,10 +556,10 @@ sub http_copy {
     local $SIG{PIPE} = sub { $pipe_closed = 1; };
 
     # okay, now get the file
-    my $sock = IO::Socket::INET->new(PeerAddr => $shost, PeerPort => $sport, Timeout => 2)
-        or return error("Unable to create socket to $shost:$sport for $spath");
+    my $sock = IO::Socket::INET->new(PeerAddr => $shostip, PeerPort => $sport, Timeout => 2)
+        or return $src_error->("Unable to create source socket to $shostip:$sport for $spath");
     $sock->write("GET $spath HTTP/1.0\r\n\r\n");
-    return error("Pipe closed retrieving $spath from $shost:$sport")
+    return error("Pipe closed retrieving $spath from $shostip:$sport")
         if $pipe_closed;
 
     # we just want a content length
@@ -572,23 +570,23 @@ sub http_copy {
         last unless length $line;
         if ($line =~ m!^HTTP/\d+\.\d+\s+(\d+)!) {
             # make sure we get a good response
-            return $error_unreachable->(1, "Error: Resource http://$shost:$sport$spath failed: HTTP $1")
+            return $error_unreachable->("Error: Resource http://$shostip:$sport$spath failed: HTTP $1")
                 unless $1 >= 200 && $1 <= 299;
         }
         next unless $line =~ /^Content-length:\s*(\d+)\s*$/i;
         $clen = $1;
     }
-    return $error_unreachable->(1, "File $spath has a content-length of 0; unable to replicate")
+    return $error_unreachable->("File $spath has a content-length of 0; unable to replicate")
         unless $clen;
-    return $error_unreachable->(1, "File $spath has unexpected content-length of $clen, not $expected_clen")
+    return $error_unreachable->("File $spath has unexpected content-length of $clen, not $expected_clen")
         if defined $expected_clen && $clen != $expected_clen;
 
     # open target for put
-    my $dsock = IO::Socket::INET->new(PeerAddr => $dhost, PeerPort => $dport, Timeout => 2)
-        or return $dest_error->("Unable to create socket to $dhost:$dport for $dpath");
+    my $dsock = IO::Socket::INET->new(PeerAddr => $dhostip, PeerPort => $dport, Timeout => 2)
+        or return $dest_error->("Unable to create dest socket to $dhostip:$dport for $dpath");
     $dsock->write("PUT $dpath HTTP/1.0\r\nContent-length: $clen\r\n\r\n")
-        or return $dest_error->("Unable to write data to $dpath on $dhost:$dport");
-    return $dest_error->("Pipe closed during write to $dpath on $dhost:$dport")
+        or return $dest_error->("Unable to write data to $dpath on $dhostip:$dport");
+    return $dest_error->("Pipe closed during write to $dpath on $dhostip:$dport")
         if $pipe_closed;
 
     # now read data and print while we're reading.
@@ -620,24 +618,9 @@ sub http_copy {
     my $line = <$dsock>;
     if ($line =~ m!^HTTP/\d+\.\d+\s+(\d+)!) {
         return 1 if $1 >= 200 && $1 <= 299;
-        return $dest_error->("Got HTTP status code $1 PUTing to http://$dhost:$dport$dpath");
+        return $dest_error->("Got HTTP status code $1 PUTing to http://$dhostip:$dport$dpath");
     } else {
-        return $dest_error->("Error: HTTP response line not recognized writing to http://$dhost:$dport$dpath: $line");
-    }
-}
-
-sub add_file_on {
-    my ($fid, $devid, $no_lock) = @_;
-
-    my $dbh = Mgd::get_dbh() or return 0;
-
-    my $rv = $dbh->do("INSERT IGNORE INTO file_on SET fid=?, devid=?",
-                      undef, $fid, $devid);
-    if ($rv > 0) {
-        return Mgd::update_fid_devcount($fid, $no_lock);
-    } else {
-        # was already on that device
-        return 1;
+        return $dest_error->("Error: HTTP response line not recognized writing to http://$dhostip:$dport$dpath: $line");
     }
 }
 

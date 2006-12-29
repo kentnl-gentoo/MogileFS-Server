@@ -1,8 +1,7 @@
 package MogileFS::ProcManager;
 use strict;
 use warnings;
-use POSIX;
-use POSIX ":sys_wait_h"; # argument for waitpid
+use POSIX qw(:sys_wait_h sigprocmask SIGINT SIG_BLOCK SIG_UNBLOCK);
 use Symbol;
 use Socket;
 
@@ -19,6 +18,9 @@ use Socket;
 our ($IsChild, @RecentQueries,
      %Mappings, %ChildrenByJob, %ErrorsTo, %Stats);
 
+our $starttime = time(); # time we got going
+sub server_starttime { return $starttime }
+
 my @IdleQueryWorkers;  # workers that are idle, able to process commands  (MogileFS::Worker::Query, ...)
 my @PendingQueries;    # [ MogileFS::Connection::Client, "$ip $query" ]
 
@@ -32,10 +34,42 @@ my %jobs   = ();    # jobname -> [ min, current ]
 
 our $allkidsup = 0;  # if true, all our kids are running. set to 0 when a kid dies.
 
+my @prefork_cleanup;  # subrefs to run to clean stuff up before we make a new child
+
 *error = \&Mgd::error;
+
+sub push_pre_fork_cleanup {
+    my ($class, $code) = @_;
+    push @prefork_cleanup, $code;
+}
 
 sub RecentQueries {
     return @RecentQueries;
+}
+
+sub write_pidfile {
+    my $class = shift;
+    my $pidfile = MogileFS->config("pidfile")
+        or return 1;
+    my $fh;
+    unless (open($fh, ">$pidfile")) {
+        Mgd::log('err', "couldn't create pidfile '$pidfile': $!");
+        return 0;
+    }
+    unless ((print $fh "$$\n") && close($fh)) {
+        Mgd::log('err', "couldn't write into pidfile '$pidfile': $!");
+        remove_pidfile();
+        return 0;
+    }
+    return 1;
+}
+
+sub remove_pidfile {
+    my $class = shift;
+    my $pidfile = MogileFS->config("pidfile")
+        or return;
+    unlink $pidfile;
+    return 1;
 }
 
 sub set_min_workers {
@@ -179,7 +213,7 @@ sub make_new_child {
     }
 
     # as a child, we want to close these and ignore them
-    Mgd::close_listeners();
+    $_->() foreach @prefork_cleanup;
     close($parents_ipc);
     undef $parents_ipc;
 
@@ -398,15 +432,6 @@ sub HandleQueryWorkerResponse {
     # the queryworker and need to pass it up the line
     return MogileFS::ProcManager->HandleChildRequest($worker, $line) if !$client;
 
-    # FIXME: HOW IS THIS EVER CALLED?  things with colons never go to HandleQueryWorkerResponse.
-    #        see MogileFS::Connection::Worker
-    # out-of-band messages (not replies to requests) start with a colon:
-    if ($line =~ /^:state_change (\w+) (\d+) (\w+)/) {
-        my ($what, $whatid, $state) = ($1, $2, $3);
-        state_change($what, $whatid, $state);
-        return;
-    }
-
     # at this point it was a command response, but if the client has gone
     # away, just reenqueue this query worker
     return MogileFS::ProcManager->NoteIdleQueryWorker($worker) if $client->{closed};
@@ -426,7 +451,7 @@ sub HandleQueryWorkerResponse {
     }
 
     # now time this interval and add to @RecentQueries
-    my $tinterval = Time::HiRes::tv_interval([$starttime]);
+    my $tinterval = Time::HiRes::time() - $starttime;
     push @RecentQueries, sprintf("%s %.4f %s", $jobstr, $tinterval, $time);
     shift @RecentQueries if scalar(@RecentQueries) > 50;
 
@@ -461,12 +486,14 @@ sub ProcessQueues {
         }
 
         # put in mapping and send data to worker
-        push @$clref, Time::HiRes::gettimeofday();
+        push @$clref, Time::HiRes::time();
         $Mappings{$worker->{fd}} = $clref;
         $Stats{queries}++;
 
         # increment our counter so we know what request counter this is going out
         $worker->{reqid}++;
+        # so we're writing a string of the form:
+        #     123-455 10.2.3.123 get_paths foo=bar&blah=bar\r\n
         $worker->write("$worker->{pid}-$worker->{reqid} $clref->[1]\r\n");
     }
 }
@@ -506,7 +533,9 @@ HELP
 
 # a child has contacted us with some command/status/something.
 sub HandleChildRequest {
-    return Mgd::error("ProcManager (Child) got request from child: $_[2]") if $IsChild;
+    if ($IsChild) {
+        Mgd::fatal("ASSERT: child $_[2] shouldn't be getting requests from other children");
+    }
 
     # if they have no job set, then their first line is what job they are
     # and not a command.  they also specify their pid, just so we know what
@@ -521,11 +550,15 @@ sub HandleChildRequest {
         # pass it on to our error handler, prefaced with the child's job
         Mgd::error("[" . $child->job . "(" . $child->pid . ")] $1");
 
+    } elsif ($cmd =~ /^debug (.+)$/i) {
+        # pass it on to our error handler, prefaced with the child's job
+        Mgd::debug("[" . $child->job . "(" . $child->pid . ")] $1");
+
     } elsif ($cmd =~ /^:state_change (\w+) (\d+) (\w+)/) {
         my ($what, $whatid, $state) = ($1, $2, $3);
         state_change($what, $whatid, $state, $child);
 
-    } elsif ($cmd =~ /^repl_unreachable (\d+)/) {
+    } elsif ($cmd =~ /^:repl_unreachable (\d+)/) {
         # announce to the other replicators that this fid can't be reached, but note
         # that we don't actually drain the queue to the requestor, as the replicator
         # isn't in a place where it can accept a queue drain right now.
@@ -582,13 +615,14 @@ sub HandleChildRequest {
 # doesn't add to queue of things child gets on next interactive command: writes immediately
 # (won't get in middle of partial write, though, as danga::socket queues things up)
 sub ImmediateSendToChildrenByJob {
-    my $childref = $ChildrenByJob{$_[1]};
+    my ($class, $dest_class, $msg, $exclude_child) = @_;
+
+    my $childref = $ChildrenByJob{$dest_class};
     return 0 unless defined $childref && %$childref;
-    my $msg = $_[2];
 
     foreach my $child (values %$childref) {
         # ignore the child specified as the third arg if one is sent
-        next if defined $_[3] && $_[3] == $child;
+        next if $exclude_child && $exclude_child == $child;
 
         # send the message to this child
         $child->write("$msg\r\n");
@@ -665,7 +699,7 @@ sub send_invalidate {
 
 sub send_monitor_has_run {
     my $child = shift;
-    for my $type (qw(replicate checker queryworker)) {
+    for my $type (qw(replicate checker queryworker delete)) {
         MogileFS::ProcManager->ImmediateSendToChildrenByJob($type, ":monitor_has_run", $child);
     }
 }

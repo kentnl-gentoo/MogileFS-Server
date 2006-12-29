@@ -3,15 +3,14 @@ package MogileFS::Worker::Delete;
 
 use strict;
 use base 'MogileFS::Worker';
-use MogileFS::Util qw(error);
-
-use POSIX ":sys_wait_h"; # argument for waitpid
-use POSIX;
+use MogileFS::Util qw(error dbcheck);
 
 # we select 1000 but only do a random 100 of them, to allow
 # for stateless paralleism
 use constant LIMIT => 1000;
 use constant PER_BATCH => 100;
+
+# TODO: use LWP and persistent connections to do deletes.  less local ports used.
 
 sub new {
     my ($class, $psock) = @_;
@@ -21,11 +20,16 @@ sub new {
     return $self;
 }
 
+sub watchdog_timeout { 60 }
+
 sub work {
     my $self = shift;
 
     my $sleep_for = 0; # we sleep longer and longer until we hit max_sleep
     my $sleep_max = 5; # max sleep when there's nothing to do.
+
+    # wait for one pass of the monitor
+    $self->wait_for_monitor;
 
   PASS:
     while (1) {
@@ -46,6 +50,7 @@ sub work {
             #    RETVAL = 0; I think I am done working for now
             #    RETVAL = 1; I have more work to do
             my $tempres = $self->process_tempfiles($dbh);
+            $self->reenqueue_delayed_deletes($dbh);
             my $delres = $self->process_deletes($dbh);
 
             # unless someone did some work, let's sleep
@@ -103,8 +108,8 @@ sub process_tempfiles {
     }
 
     # TODO: error checking
-    $dbh->do("INSERT INTO file_on (fid, devid) VALUES " . join(',', @questions), undef, @binds);
-    $dbh->do("INSERT INTO file_to_delete VALUES " . join(',', map { "(?)" } @fids), undef, @fids);
+    $dbh->do("INSERT IGNORE INTO file_on (fid, devid) VALUES " . join(',', @questions), undef, @binds);
+    $dbh->do("INSERT IGNORE INTO file_to_delete VALUES " . join(',', map { "(?)" } @fids), undef, @fids);
     $dbh->do("DELETE FROM tempfile WHERE fid IN (" . join(',', @fids) . ")");
     return 1;
 }
@@ -119,81 +124,140 @@ sub process_deletes {
     my $count = $delmap ? scalar @$delmap : 0;
     return 0 unless $count;
 
-    my %dev_down;  # devid -> 1 (when device times out due to EIO)
     my $done = 0;
     foreach my $dm (List::Util::shuffle(@$delmap)) {
+        last if ++$done > PER_BATCH;
+
+        $self->still_alive;
         $self->read_from_parent;
         my ($fid, $devid) = @$dm;
+        error("deleting fid $fid, on devid $devid...") if $Mgd::DEBUG >= 2;
 
-        # if no device is returned from the query above, that
-        # means there are no file_on rows for it, and we can consider
-        # it now deleted.
-        unless (defined $devid) {
+        my $done_with_fid = sub {
+            my $reason = shift;
             $dbh->do("DELETE FROM file_to_delete WHERE fid=?", undef, $fid);
+            dbcheck($dbh, "Failure to delete from file_to_delete for fid=$fid");
+        };
+
+        my $done_with_devid = sub {
+            my $reason = shift;
+            $dbh->do("DELETE FROM file_on WHERE fid=? AND devid=?",
+                     undef, $fid, $devid);
+            dbcheck($dbh, "Failure to delete from file_on for $fid/$devid");
+            die "Failed to delete from file_on: " . $dbh->errstr if $dbh->err;
+        };
+
+        my $reschedule_fid = sub {
+            my ($secs, $reason) = (int(shift), shift);
+            $dbh->do("INSERT IGNORE INTO file_to_delete_later (fid, delafter) ".
+                     "VALUES (?,UNIX_TIMESTAMP()+$secs)", undef,
+                     $fid);
+            dbcheck($dbh, "Failure to insert into file_to_delete_later");
+            error("delete of fid $fid rescheduled: $reason") if $Mgd::DEBUG >= 2;
+            $done_with_fid->("rescheduled");
+        };
+
+        # Cases:
+        #   devid is null:  doesn't exist anywhere anymore, we're done with this fid.
+        #   devid is observed down/readonly: delay for 10 minutes
+        #   devid is marked readonly: delay for 2 hours
+        #   devid is marked dead or doesn't exist: consider it deleted on this devid.
+
+        # CASE: devid is null, which means we're done deleting all instances.
+        unless (defined $devid) {
+            $done_with_fid->("no_more_locations");
             next;
         }
 
-        # don't try to delete from this device if we earlier
-        # found it to be timing out with EIO
-        next if $dev_down{$devid};
-
-        last if ++$done > PER_BATCH;
-
-        my $path = Mgd::make_path($devid, $fid);
-        my $rv = 0;
-        if (my $urlref = Mgd::is_url($path)) {
-            # hit up the server and delete it
-            # TODO: (optimization) use MogileFS->get_observed_state and don't try to delete things known to be down/etc
-            my $sock = IO::Socket::INET->new(PeerAddr => $urlref->[0],
-                                             PeerPort => $urlref->[1],
-                                             Timeout => 2);
-            unless ($sock) {
-                # timeout or something, mark this device as down for now and move on
-                $dev_down{$devid} = 1;
-                next;
-            }
-
-            # send delete request
-            error("Sending delete for $path") if $Mgd::DEBUG >= 2;
-            $sock->write("DELETE $urlref->[2] HTTP/1.0\r\n\r\n");
-            my $response = <$sock>;
-            if ($response =~ m!^HTTP/\d+\.\d+\s+(\d+)!) {
-                if (($1 >= 200 && $1 <= 299) || $1 == 404) {
-                    # effectively means all went well
-                    $rv = 1;
-                } else {
-                    # remote file system error?  mark node as down
-                    error("Error: unlink failure: $path: $1");
-                    $dev_down{$devid} = 1;
-                    next;
-                }
-            } else {
-                error("Error: unknown response line: $response");
-            }
-        } else {
-            # do normal unlink
-            $rv = unlink "$Mgd::MOG_ROOT/$path";
-
-            # device is timing out.  take note of it and
-            # continue dealing with other deletes
-            if (! $rv) {
-                if ($! == EIO) {
-                    $dev_down{$devid} = 1;
-                    next;
-                } elsif ($! == ENOENT) {
-                    $rv = 1;  # count non-existent file as deleted
-                }
-            }
+        # CASE: devid is marked dead or doesn't exist: consider it deleted on this devid.
+        my $dev = MogileFS::Device->of_devid($devid);
+        unless ($dev->exists) {
+            $done_with_devid->("devid_doesnt_exist");
+            next;
+        }
+        if ($dev->is_marked_dead) {
+            $done_with_devid->("devid_marked_dead");
+            next;
         }
 
-        # if we deleted it, or it didn't exist, consider it
-        # deleted.
-        $dbh->do("DELETE FROM file_on WHERE fid=? AND devid=?",
-                 undef, $fid, $devid) if $rv;
+        # CASE: devid is observed down/readonly: delay for 10 minutes
+        unless ($dev->observed_writeable) {
+            $reschedule_fid->(60 * 10, "not_observed_writeable");
+            next;
+        }
+
+        # CASE: devid is marked readonly/down: delay for 2 hours
+        if ($dev->status ne "alive") {
+            $reschedule_fid->(60 * 60 * 2, "devid_marked_not_alive");
+            next;
+        }
+
+        my $dfid = MogileFS::DevFID->new($dev, $fid);
+        my $path = $dfid->url;
+
+        # dormando: "There are cases where url can return undefined,
+        # Mogile appears to try to replicate to bogus devices
+        # sometimes?"
+        unless ($path) {
+            error("in deleter, url(devid=$devid, fid=$fid) returned nothing");
+            next;
+        }
+
+        my $urlparts = MogileFS::Util::url_parts($path);
+
+        # hit up the server and delete it
+        # TODO: (optimization) use MogileFS->get_observed_state and don't try to delete things known to be down/etc
+        my $sock = IO::Socket::INET->new(PeerAddr => $urlparts->[0],
+                                         PeerPort => $urlparts->[1],
+                                         Timeout => 2);
+        unless ($sock) {
+            # timeout or something, mark this device as down for now and move on
+            $self->broadcast_host_unreachable($dev->hostid);
+            $reschedule_fid->(60 * 60 * 2, "no_sock_to_hostid");
+            next;
+        }
+
+        # send delete request
+        error("Sending delete for $path") if $Mgd::DEBUG >= 2;
+
+        $sock->write("DELETE $urlparts->[2] HTTP/1.0\r\n\r\n");
+        my $response = <$sock>;
+        if ($response =~ m!^HTTP/\d+\.\d+\s+(\d+)!) {
+            if (($1 >= 200 && $1 <= 299) || $1 == 404) {
+                # effectively means all went well
+                $done_with_devid->("deleted");
+            } else {
+                # remote file system error?  mark node as down
+                my $httpcode = $1;
+                error("Error: unlink failure: $path: HTTP code $httpcode");
+                $reschedule_fid->(60 * 30, "http_code_$httpcode");
+                next;
+            }
+        } else {
+            error("Error: unknown response line deleting $path: $response");
+        }
     }
 
     # as far as we know, we have more work to do
     return 1;
+}
+
+sub reenqueue_delayed_deletes {
+    my ($self, $dbh) = @_;
+    my $fids = $dbh->selectcol_arrayref(qq{
+        SELECT fid
+        FROM file_to_delete_later
+        WHERE delafter < UNIX_TIMESTAMP()
+        LIMIT 500
+    });
+    return unless $fids && @$fids;
+
+    $dbh->do("INSERT IGNORE INTO file_to_delete (fid) VALUES " .
+             join(",", map { "($_)" } @$fids));
+    dbcheck($dbh, "reenqueue file_to_delete insert");
+    $dbh->do("DELETE FROM file_to_delete_later WHERE fid IN (" .
+             join(",", @$fids) . ")");
+    dbcheck($dbh, "reenqueue file_to_delete_later delete");
 }
 
 1;

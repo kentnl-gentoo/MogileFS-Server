@@ -5,12 +5,19 @@ use MogileFS::ProcManager;
 
 our @ISA = qw(Exporter);
 our @EXPORT = qw($DEBUG config set_config);
+our @EXPORT_OK = qw(DEVICE_SUMMARY_CACHE_TIMEOUT);
 
-our ($DEFAULT_CONFIG, $DEFAULT_MOG_ROOT, $MOG_ROOT, $MOGSTORED_STREAM_PORT, $DEBUG, $USE_HTTP);
+our ($DEFAULT_CONFIG, $DEFAULT_MOG_ROOT, $MOG_ROOT, $MOGSTORED_STREAM_PORT, $DEBUG);
 $DEBUG = 0;
 $DEFAULT_CONFIG = "/etc/mogilefs/mogilefsd.conf";
 $DEFAULT_MOG_ROOT = "/mnt/mogilefs";
 $MOGSTORED_STREAM_PORT = 7501;
+
+use constant DEVICE_SUMMARY_CACHE_TIMEOUT => 15;
+
+# this is incremented whenever the schema changes.  server will refuse
+# to start-up with an old schema version
+use constant SCHEMA_VERSION => 7;
 
 my %conf;
 sub set_config {
@@ -56,6 +63,7 @@ our (
     $max_disk_age,
     $node_timeout,          # time in seconds to wait for storage node responses
     $old_repl_compat,
+    $pidfile,
    );
 
 our $default_mindevcount;
@@ -69,7 +77,7 @@ sub load_config {
                              'c|config=s'    => \$config,
                              's|skipconfig'  => \$skipconfig,
                              'd|debug+'      => \$cmdline{debug},
-                             'D|daemon'      => \$cmdline{daemonize},
+                             'D|daemonize'   => \$cmdline{daemonize},
                              'dsn=s'         => \$cmdline{db_dsn},
                              'dbuser=s'      => \$cmdline{db_user},
                              'dbpass:s'      => \$cmdline{db_pass},
@@ -77,12 +85,13 @@ sub load_config {
                              'r|mogroot=s'   => \$cmdline{mog_root},
                              'p|confport=i'  => \$cmdline{conf_port},
                              'w|workers=i'   => \$cmdline{query_jobs},
-                             'no_http'       => \$cmdline{no_http},
+                             'no_http'       => \$cmdline{no_http},  # OLD, we just eat it to shut it up.
                              'workerport=i'  => \$dummy_workerport,  # eat it for backwards compat
                              'maxdiskage=i'  => \$cmdline{max_disk_age},
                              'minfreespace=i' => \$cmdline{min_free_space},
                              'default_mindevcount=i' => \$cmdline{default_mindevcount},
                              'node_timeout=i' => \$cmdline{node_timeout},
+                             'pidfile=s'      => \$cmdline{pidfile},
                              'no_schema_check' => \$cmdline{no_schema_check},
                              'old_repl_compat=i' => \$cmdline{old_repl_compat},
                              );
@@ -122,7 +131,7 @@ sub load_config {
     # Fill in defaults for those values which were either loaded from config or
     # specified on the command line. Command line takes precendence, then values in
     # the config file, then the defaults.
-    $daemonize      = choose_value( 'daemonize', 0, 1 );
+    $daemonize      = choose_value( 'daemonize', 0 );
     $db_dsn         = choose_value( 'db_dsn', "DBI:mysql:mogilefs" );
     $db_user        = choose_value( 'db_user', "mogile" );
     $db_pass        = choose_value( 'db_pass', "", 1 );
@@ -140,8 +149,9 @@ sub load_config {
     $checker_jobs   = choose_value( 'checker_jobs', 1 );
     $min_free_space = choose_value( 'min_free_space', 100 );
     $max_disk_age   = choose_value( 'max_disk_age', 5 );
-    $DEBUG          = choose_value( 'debug', $ENV{DEBUG} || 0, 1 );
-    $USE_HTTP       = ! choose_value( 'no_http', 0, 1);
+    $DEBUG          = choose_value( 'debug', $ENV{DEBUG} || 0 );
+    $pidfile        = choose_value( 'pidfile', "" );
+
     $default_mindevcount = choose_value( 'default_mindevcount', 2 );
     $node_timeout   = choose_value( 'node_timeout', 2 );
 
@@ -178,7 +188,46 @@ sub config {
     return $conf{$k};
 }
 
-sub http_mode   { return $USE_HTTP; }
+sub check_database {
+    my $sto = eval { Mgd::get_store() };
+    unless ($sto && $sto->ping) {
+        die qq{
+Error: unable to establish connection with your MogileFS database.
+
+Please verify that you have correctly setup a configuration file or are
+providing the correct information in order to reach the database and try
+running the MogileFS server again.  If you haven\'t setup your database yet,
+run 'mogdbsetup'.
+}
+    }
+
+    my $sversion = MogileFS::Config->server_setting('schema_version') || 0;
+    unless ($sversion == SCHEMA_VERSION || MogileFS::Config->config('no_schema_check')) {
+        my $exp = SCHEMA_VERSION;
+        die "Server's database schema version of $sversion doesn't match expected value of $exp.  Halting.\n\n".
+            "Please run mogdbsetup to upgrade your schema.\n";
+    }
+}
+
+# set_server_setting( key, value )
+#   set value to undef to remove whatever is presently stored; returns 1 on success or
+#   undef on error
+sub set_server_setting {
+    my ($class, $key, $val) = @_;
+    return unless $key;
+
+    my $sto = Mgd::get_store();
+    $sto->set_server_setting($key, $val);
+    return 1;
+}
+
+# get_server_setting( key )
+#   get value of server setting, undef on error (or no result)
+sub server_setting {
+    my ($class, $key) = @_;
+    return Mgd::get_store()->server_setting($key);
+}
+
 
 1;
 

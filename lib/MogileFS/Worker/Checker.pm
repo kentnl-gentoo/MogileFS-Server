@@ -6,7 +6,6 @@ use base 'MogileFS::Worker';
 use MogileFS::Util qw( every error );
 use List::Util ();
 use LWP::UserAgent;
-use POSIX;
 use Time::HiRes ();
 
 use constant SUCCESS => 0;
@@ -40,7 +39,7 @@ sub work {
         $self->parent_ping;
 
         # see if we're even enabled
-        my $setting = Mgd::get_server_setting('fsck_enable');
+        my $setting = MogileFS::Config->server_setting('fsck_enable');
         return unless defined $setting && $setting ne 'off' && is_valid_level($setting);
 
         # checking doesn't go well if the monitor job hasn't actively started
@@ -122,7 +121,7 @@ sub work {
 
         # if we fell out, there are no more fids, so let's grab a chunk and throw them
         # into the database to work on next
-        my $highest_fid = Mgd::get_server_setting('fsck_highest_fid_checked') || 0;
+        my $highest_fid = MogileFS::Config->server_setting('fsck_highest_fid_checked') || 0;
         my $total_already = $dbh->selectrow_array('SELECT COUNT(*) FROM fsck WHERE nextcheck < UNIX_TIMESTAMP()') || 0;
         my $limit = 10_000 - $total_already;  # but only up to $limit items
 
@@ -146,7 +145,7 @@ sub work {
             # the race buster:  (keeps window moving in race described above)
             my $new_max      = $max_fsck_fid > $min_progress ? $max_fsck_fid : $min_progress;
 
-            Mgd::set_server_setting('fsck_highest_fid_checked', $new_max || 0);
+            MogileFS::Config->set_server_setting('fsck_highest_fid_checked', $new_max || 0);
             $sleep_set->(0); # don't sleep in next round.
         }
     });
@@ -205,7 +204,8 @@ sub check_fid {
         # setup and do the request.  these failures are total failures in that we expect
         # them to work again later, as it's probably transient and will persist no matter
         # how many paths we try.
-        my $path = Mgd::make_http_path($devid, $fid)
+        my $dfid = MogileFS::DevFID->new($devid, $fid);
+        my $path = $dfid->get_url
             or return $retunlock->(TEMPORARY, 'failure to create HTTP path to file');
         my $ua = LWP::UserAgent->new(timeout => 3)
             or return $retunlock->(TEMPORARY, 'failed to create LWP::UserAgent object');

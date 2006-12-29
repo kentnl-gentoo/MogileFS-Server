@@ -9,8 +9,8 @@ my %args = (
             dbname => "mogilefs",
             dbrootuser => "root",
             dbrootpass => "",
-            dbuser => "mog",
-            dbpass => "mogpass",
+            dbuser => "mogile",
+            dbpass => "",
             );
 
 my $opt_help;
@@ -54,11 +54,11 @@ Options:
  --dbrootpass=    <blank>      MySQL administrator password.  Only needed
                                for initial setup, not subsequent upgrades
 
- --dbuser=        mog          Regular MySQL user to create and/or use
+ --dbuser=        mogile       Regular MySQL user to create and/or use
                                for MogileFS database.  This is what the
                                mogilefsd trackers connect as.
 
- --dbpass=        mogpass      You should change this, especially if your
+ --dbpass=        <blank>      You should change this, especially if your
                                MySQL servers are accessible to other users
                                on the network.  But they shouldn't be
                                if you're running MogileFS, because MogileFS
@@ -147,7 +147,9 @@ sub normal_conn {
 sub upgrade_database {
     my ($host, $name, $user, $pass) = @_;
 
-    my $SCHEMA_VERSION = 6;
+    my $SCHEMA_VERSION = 7;
+    # schema history:
+    #   7: adds file_to_delete_later table
     my $curver = schema_version();
 
     if ($curver == $SCHEMA_VERSION) {
@@ -299,9 +301,7 @@ sub upgrade_database {
    UNIQUE     (hostip),
    altip      VARCHAR(15),
    UNIQUE     (altip),
-   altmask    VARCHAR(18),
-
-   remoteroot  VARCHAR(60)
+   altmask    VARCHAR(18)
 )");
 
 # disks
@@ -362,6 +362,13 @@ sub upgrade_database {
    failcount  TINYINT UNSIGNED NOT NULL DEFAULT 0,
    flags      SMALLINT UNSIGNED NOT NULL DEFAULT 0
    )");
+
+    $run->("CREATE TABLE IF NOT EXISTS file_to_delete_later (
+   fid  INT UNSIGNED NOT NULL,
+   PRIMARY KEY (fid),
+   delafter INT UNSIGNED NOT NULL,
+   INDEX (delafter)
+)");
 
     if ($opt_noschemabump) {
         warn "\n*\n* Per your request, NOT UPGRADING to $SCHEMA_VERSION.  I assume you understand why.\n*\n";

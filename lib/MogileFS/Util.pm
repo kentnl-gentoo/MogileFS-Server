@@ -5,7 +5,10 @@ use Time::HiRes;
 
 require Exporter;
 our @ISA = qw(Exporter);
-our @EXPORT_OK = qw(error daemonize weighted_list every);
+our @EXPORT_OK = qw(
+                    error debug fatal daemonize weighted_list every dbcheck
+                    wait_for_readability wait_for_writeability
+                    );
 
 sub every {
     my ($delay, $code) = @_;
@@ -30,14 +33,38 @@ sub every {
     }
 }
 
-sub error {
+sub debug {
+    my ($msg, $level) = @_;
+    return unless $Mgd::DEBUG >= 1;
     if (my $worker = MogileFS::ProcManager->is_child) {
-        $worker->send_to_parent("error $_[0]");
+        $worker->send_to_parent("debug $msg");
     } else {
-        MogileFS::ProcManager->NoteError(\$_[0]);
-        Mgd::log('debug', $_[0]);
+        my $dbg = "[debug] $msg";
+        MogileFS::ProcManager->NoteError(\$dbg);
+        Mgd::log('debug', $msg);
+    }
+}
+
+our $last_error;
+sub error {
+    my ($errmsg) = @_;
+    $last_error = $errmsg;
+    if (my $worker = MogileFS::ProcManager->is_child) {
+        $worker->send_to_parent("error $errmsg");
+    } else {
+        MogileFS::ProcManager->NoteError(\$errmsg);
+        Mgd::log('debug', $errmsg);
     }
     return 0;
+}
+sub last_error {
+    return $last_error;
+}
+
+sub fatal {
+    my ($errmsg) = @_;
+    error($errmsg);
+    die $errmsg;
 }
 
 sub daemonize {
@@ -115,5 +142,50 @@ sub weighted_list {
     push @ret, $getone->() while @list;
     return @ret;
 }
+
+sub dbcheck {
+    my ($dbh, $errmsg) = @_;
+    return unless $dbh->err;
+    $errmsg .= ": " . $dbh->err . ": " . $dbh->errstr;
+    error($errmsg);  # propogate to parent for listeners
+    die $errmsg;
+}
+
+# given a file descriptor number and a timeout, wait for that descriptor to
+# become readable; returns 0 or 1 on if it did or not
+sub wait_for_readability {
+    my ($fileno, $timeout) = @_;
+    return 0 unless $fileno && $timeout >= 0;
+
+    my $rin;
+    vec($rin, $fileno, 1) = 1;
+    my $nfound = select($rin, undef, undef, $timeout);
+
+    # nfound can be undef or 0, both failures, or 1, a success
+    return $nfound ? 1 : 0;
+}
+
+sub wait_for_writeability {
+    my ($fileno, $timeout) = @_;
+    return 0 unless $fileno && $timeout;
+
+    my $rout;
+    vec($rout, $fileno, 1) = 1;
+    my $nfound = select(undef, $rout, undef, $timeout);
+
+    # nfound can be undef or 0, both failures, or 1, a success
+    return $nfound ? 1 : 0;
+}
+
+# if given an HTTP URL, break it down into [ host, port, URI ], else
+# returns die, because we don't support non-http-mode anymore
+sub url_parts {
+    my $path = shift;
+    if ($path =~ m!^http://(.+?)(?::(\d+))?(/.+)$!) {
+        return [ $1, $2 || 80, $3 ];
+    }
+    Carp::croak("Bogus URL: $path");
+}
+
 
 1;

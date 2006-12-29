@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 #   Perl Makefile for Danga-Socket
-#   $Id: Makefile.PL 398 2006-09-25 17:47:57Z bradfitz $
+#   $Id: Makefile.PL 580 2006-12-29 06:02:36Z bradfitz $
 #
 #   Invoke with 'perl Makefile.PL'
 #
@@ -17,28 +17,20 @@ $exefiles = ["mogilefsd"] if exists $ENV{DANGABUILD_MOGILEFSDONLY};
 
 WriteMakefile(
     NAME                    => 'mogilefs-server',
-    VERSION                 => '2.00_03',
+    VERSION                 => '2.00_04',
     AUTHOR                  => 'Brad Fitzpatrick <brad@danga.com>',
     ABSTRACT                => 'MogileFS server components',
     EXE_FILES               => $exefiles,
     PREREQ_PM               => {
-        'Danga::Socket'    => '1.22',
-        'Perlbal'          => 0,    # FIXME: add version to Perlbal (added as of Perlbal 1.43)
-                                    # but really we're going to make Perlbal.pm optional, for running mogstored
-                                    # in only-monitor/usage-writeout mode.  so maybe not.
-        'Sys::Syslog'      => 0,
+        'Danga::Socket'    => '1.56',
+        'Perlbal'          => '1.52',  # Future: make Perlbal optional, for running mogstored
+                                       # in only-monitor/usage-writeout mode.
+        'Sys::Syslog'      => 0,,
+        'Sys::Syscall'     => '0.22',
         'Getopt::Long'     => 0,
         'Symbol'           => 0,
         'Net::Netmask'     => 0,
         fields            => 0,
     },
-    dist                    => {
-        CI                      => "cvs commit",
-        RCS_LABEL               => 'cvs tag RELEASE_$(VERSION_SYM)',
-        SUFFIX                  => ".gz",
-        DIST_DEFAULT            => 'all tardist',
-        COMPRESS                => "gzip",
-    },
-
 );
 
