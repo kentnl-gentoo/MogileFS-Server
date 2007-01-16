@@ -5,6 +5,9 @@ use warnings;
 use Test::More;
 use FindBin qw($Bin);
 
+use MogileFS::Server;
+use MogileFS::Util qw(error_code);
+
 use lib "$Bin/../../api/perl/lib";
 BEGIN {
     $ENV{PERL5LIB} = "$Bin/../../api/perl/lib" . ($ENV{PERL5LIB} ? ":$ENV{PERL5LIB}" : "");
@@ -13,7 +16,6 @@ use MogileFS::Client;
 
 require 't/lib/mogtestlib.pl';
 
-# create temp mysql db,
 # use mogadm to init it,
 # mogstored on temp dir,
 # register mogstored temp dir,
@@ -21,24 +23,16 @@ require 't/lib/mogtestlib.pl';
 # add file,
 # etc
 
-my $rootdbh = eval { root_dbh(); };
-if ($rootdbh) {
-    plan tests => 44;
+my $sto = eval { temp_store(); };
+if ($sto) {
+    plan tests => 55;
 } else {
-    plan skip_all => "Can't connect to local MySQL as root user.";
+    plan skip_all => "Can't create temporary test database: $@";
     exit 0;
 }
 
-my $tempdb = create_temp_db();
-isa_ok $tempdb, "DBHandle";
-my $dbh = $tempdb->dbh;
-
+my $dbh = $sto->dbh;
 my $rv;
-$rv = system("$Bin/../mogdbsetup", "--yes", "--dbname=" . $tempdb->name);
-ok(!$rv, "database setup proceeded without problems");
-
-$rv = system("$Bin/../mogdbsetup", "--yes", "--dbname=" . $tempdb->name);
-ok(!$rv, "database setup ran again without problems");
 
 use File::Temp;
 my %mogroot;
@@ -64,8 +58,24 @@ while (! -e "$mogroot{1}/dev1/usage" &&
     sleep 1;
 }
 
-my $tmptrack = create_temp_tracker($tempdb);
+my $tmptrack = create_temp_tracker($sto);
 ok($tmptrack);
+
+my $mogc = MogileFS::Client->new(
+                                 domain => "testdom",
+                                 hosts  => [ "127.0.0.1:7001" ],
+                                 );
+my $be = $mogc->{backend}; # gross, reaching inside of MogileFS::Client
+
+# test some basic commands to backend
+ok($be->do_request("test", {}), "test ping worked");
+ok(!$be->do_request("test", {crash => 1}), "crash didn't");
+ok($be->do_request("test", {}), "test ping again worked");
+
+
+ok($tmptrack->mogadm("domain", "add", "todie"), "created todie domain");
+ok($tmptrack->mogadm("domain", "delete", "todie"), "delete todie domain");
+ok(!$tmptrack->mogadm("domain", "delete", "todie"), "didn't delete todie domain again");
 
 ok($tmptrack->mogadm("domain", "add", "testdom"), "created test domain");
 ok($tmptrack->mogadm("class", "add", "testdom", "2copies", "--mindevcount=2"), "created 2copies class in testdom");
@@ -83,41 +93,48 @@ ok($tmptrack->mogadm("device", "add", "hostB", 4), "created dev4 on hostB");
 #ok($tmptrack->mogadm("device", "mark", "hostB", 3, "alive"), "dev3 alive");
 #ok($tmptrack->mogadm("device", "mark", "hostB", 4, "alive"), "dev4 alive");
 
-my $mogc = MogileFS::Client->new(
-                                 domain => "testdom",
-                                 hosts  => [ "127.0.0.1:7001" ],
-                                 );
-
 # wait for monitor
-my $be = $mogc->{backend}; # gross, reaching inside of MogileFS::Client
 {
     my $was = $be->{timeout};  # can't use local on phash :(
     $be->{timeout} = 10;
-    ok($be->do_request("do_monitor_round", {}), "waited for monitor");
-    die $be->errstr if $be->err;
+    ok($be->do_request("do_monitor_round", {}), "waited for monitor")
+        or die "Failed to wait for monitor";
     $be->{timeout} = $was;
 }
 
-# create one sample file
-my $fh = $mogc->new_file("file1", "2copies");
-ok($fh, "got filehandle");
-unless ($fh) {
-    die "Error: " . $mogc->errstr;
-}
-
+# create two sample files
 my $data = "My test file.\n" x 1024;
-print $fh $data;
-ok(close($fh), "closed file");
-
-my $tries = 1;
-my @urls;
-while ($tries++ < 10 && (@urls = $mogc->get_paths("file1")) < 2) {
-    sleep 1;
+foreach my $k (qw(file1 file2)) {
+    my $fh = $mogc->new_file($k, "2copies");
+    ok($fh, "got filehandle") or
+        die "Error: " . $mogc->errstr;
+    print $fh $data;
+    ok(close($fh), "closed file");
 }
-is(scalar @urls, 2, "replicated to 2 paths");
 
-my $to_repl_rows = $dbh->selectrow_array("SELECT COUNT(*) FROM file_to_replicate");
-is($to_repl_rows, 0, "no more files to replicate");
+# quick delete test
+ok($mogc->delete("file2"), "deleted file2")
+    or die "Error: " . $mogc->errstr;
+
+# verify we can't delete the domain now
+ok(!$tmptrack->mogadm("domain", "delete", "testdom"), "can't delete domain in use");
+
+# wait for it to replicate
+my @urls;
+ok(try_for(10, sub {
+    @urls = $mogc->get_paths("file1");
+    my $nloc = @urls;
+    if ($nloc < 2) {
+        diag("file1 still only on $nloc devices");
+        return 0;
+    }
+    return 1;
+}), "replicated to 2 paths");
+
+ok(try_for(3, sub {
+    my $to_repl_rows = $dbh->selectrow_array("SELECT COUNT(*) FROM file_to_replicate");
+    return $to_repl_rows == 0;
+}), "no more files to replicate");
 
 my $p1 = MogPath->new($urls[0]);
 my $p2 = MogPath->new($urls[1]);
@@ -134,15 +151,27 @@ for (1..10) {
     isnt($urls[0], $dead_url, "didn't return dead url first (try $_)");
 }
 
+ok($be->do_request("rename", {
+    from_key => "file1",
+    to_key   => "file1renamed",
+    domain   => "testdom",
+}), "renamed file1 to file1renamed");
+
+ok($be->do_request("delete", {
+    key    => "file1renamed",
+    domain => "testdom",
+}), "deleted file1renamed");
+
 # create a couple hundred files now
 my $n_files = 100;
+diag("Creating $n_files files...");
 for my $n (1..$n_files) {
     my $fh = $mogc->new_file("manyhundred_$n", "2copies")
-        or die "Failed to create manyhundred_$n";
+        or die "Failed to create manyhundred_$n: " . $mogc->errstr;
     my $data = "File number $n.\n" x 512;
     print $fh $data;
     close($fh) or die "Failed to close manyhundred_$n";
-    diag("created $n/$n_files") if $n % 25 == 0;
+    diag("created $n/$n_files") if $n % 10 == 0;
 }
 pass("Created a ton of files");
 
@@ -196,14 +225,22 @@ ok(try_for(15, sub {
 # kill hostB now
 ok($tmptrack->mogadm("host", "delete", "hostB"), "killed hostB");
 
+# delete them all, see if they go away.
+for my $n (1..$n_files) {
+    my $rv = $mogc->delete("manyhundred_$n")
+        or die "Failed to delete manyhundred_$n";
+}
+pass("deleted all $n_files files");
 
-# enable fsck (job already running, but waiting for config update)
-
-# do get_paths again and wait for it to go to 2, reliably.  or, wait for 1st path to be $dead_url, which is now not dead.
-
-
-#$dbh->do("INSERT INTO file_to_replicate SET fid=7");
-#sleep 60;
+ok(try_for(20, sub {
+    my @files;
+    foreach my $hn (1, 3) {
+        my @lfiles = `find $mogroot{$hn} -type f -name '*.fid'`;
+        push @files, @lfiles;
+        diag("files on host $hn = " . scalar(@lfiles));
+    }
+    return @files == 0;
+}), "and they're gone from filesystem");
 
 
 sub try_for {

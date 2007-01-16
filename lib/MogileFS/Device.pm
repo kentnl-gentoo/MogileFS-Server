@@ -2,10 +2,25 @@ package MogileFS::Device;
 use strict;
 use warnings;
 use Carp qw(croak);
+use MogileFS::Config qw(DEVICE_SUMMARY_CACHE_TIMEOUT);
+
+BEGIN {
+    my $testing = $ENV{TESTING} ? 1 : 0;
+    eval "sub TESTING () { $testing }";
+}
 
 my %singleton;      # devid -> instance
 my $last_load = 0;  # unixtime we last reloaded devices from database
 my $all_loaded = 0; # bool: have we loaded all the devices?
+
+# throws "dup" on duplicate devid.  returns new MogileFS::Device object on success.
+# %args include devid, hostid, and status (in (alive, down, readonly))
+sub create {
+    my ($pkg, %args) = @_;
+    my $devid = Mgd::get_store()->create_device(@args{qw(devid hostid status)});
+    MogileFS::Device->invalidate_cache;
+    return $pkg->of_devid($devid);
+}
 
 sub of_devid {
     my ($class, $devid) = @_;
@@ -15,6 +30,17 @@ sub of_devid {
         no_mkcol => 0,
         _loaded  => 0,
     }, $class;
+}
+
+sub from_devid_and_hostname {
+    my ($class, $devid, $hostname) = @_;
+    my $dev = MogileFS::Device->of_devid($devid)
+        or return undef;
+    return undef unless $dev->exists;
+    my $host = $dev->host;
+    return undef
+        unless $host && $host->exists && $host->hostname eq $hostname;
+    return $dev;
 }
 
 sub vivify_directories {
@@ -148,11 +174,8 @@ sub reload_devices {
 
     MogileFS::Host->check_cache;
 
-    my $dbh = Mgd::get_dbh();
-    my $sth = $dbh->prepare("SELECT /*!40000 SQL_CACHE */ devid, hostid, mb_total, " .
-                            "mb_used, mb_asof, status, weight FROM device");
-    $sth->execute;
-    while (my $row = $sth->fetchrow_hashref) {
+    my $sto = Mgd::get_store();
+    foreach my $row ($sto->get_all_devices) {
         my $dev =
             MogileFS::Device->of_devid($row->{devid});
         $dev->absorb_dbrow($row);
@@ -184,7 +207,7 @@ sub invalidate_cache {
 sub check_cache {
     my $class = shift;
     my $now = time();
-    return if $last_load > $now - 5;
+    return if $last_load > $now - DEVICE_SUMMARY_CACHE_TIMEOUT;
     MogileFS::Device->reload_devices;
 }
 
@@ -206,26 +229,48 @@ sub absorb_dbrow {
     $dev->{mb_free} = $dev->{mb_total} - $dev->{mb_used};
 
     my $host = MogileFS::Host->of_hostid($dev->{hostid});
-    unless ($host && $host->exists) {
+    if ($host && $host->exists) {
+        my $host_status = $host->status;
+        die "No status" unless $host_status =~ /^\w+$/;
+        # FIXME: not sure I like this, changing the in-memory version
+        # of the configured status is.  I'd rather this be calculated
+        # in an accessor.
+        if ($dev->{status} eq 'alive' && $host_status ne 'alive') {
+            $dev->{status} = "down"
+        }
+    } else {
         if ($dev->{status} eq "dead") {
             # ignore dead devices without hosts.  not a big deal.
-            next;
         } else {
             die "No host for dev $dev->{devid} (host $dev->{hostid})";
         }
     }
 
-    my $host_status = $host->status;
-    die "No status" unless $host_status =~ /^\w+$/;
+    $dev->{_loaded} = 1;
+}
 
-    # FIXME: not sure I like this, changing the in-memory version
-    # of the configured status is.  I'd rather this be calculated
-    # in an accessor.
-    if ($dev->{status} eq 'alive' && $host_status ne 'alive') {
-        $dev->{status} = "down"
+our $util_no_broadcast = 0;
+
+sub set_observed_utilization {
+    my ($dev, $util) = @_;
+    $dev->{utilization} = $util;
+    my $devid = $dev->id;
+
+    return if $util_no_broadcast;
+
+    my $worker = MogileFS::ProcManager->is_child or return;
+    $worker->send_to_parent(":set_dev_utilization $devid $util");
+}
+
+sub observed_utilization {
+    my ($dev) = @_;
+
+    if (TESTING) {
+        my $weight_varname = 'T_FAKE_IO_DEV' . $dev->id;
+        return $ENV{$weight_varname} if defined $ENV{$weight_varname};
     }
 
-    $dev->{_loaded} = 1;
+    return $dev->{utilization};
 }
 
 sub set_observed_state {
@@ -262,7 +307,9 @@ sub status {
 
 sub weight {
     my $dev = shift;
+
     $dev->_load;
+
     return $dev->{weight};
 }
 
@@ -367,10 +414,8 @@ sub fid_list {
     croak("No limit specified") unless $limit && $limit =~ /^\d+$/;
     croak("Unknown options to fid_list") if %opts;
 
-    my $dbh = Mgd::get_dbh();
-    my $fidids = $dbh->selectcol_arrayref("SELECT fid FROM file_on WHERE devid = ? LIMIT $limit",
-                                          undef, $self->devid);
-    die "Error selecting jobs to reap: " . $dbh->errstr if $dbh->err;
+    my $sto = Mgd::get_store();
+    my $fidids = $sto->get_fidids_by_device($self->devid, $limit);
     return map {
         MogileFS::FID->new($_)
     } @{$fidids || []};
@@ -378,10 +423,7 @@ sub fid_list {
 
 sub forget_about {
     my ($dev, $fid) = @_;
-    my $dbh = Mgd::get_dbh();
-    $dbh->do('DELETE FROM file_on WHERE fid = ? AND devid = ?',
-             undef, $fid->id, $dev->id);
-    die $dbh->errstr if $dbh->err;
+    Mgd::get_store()->remove_fidid_from_devid($fid->id, $dev->id);
     return 1;
 }
 
@@ -399,10 +441,29 @@ sub overview_hashref {
 
     my $ret = {};
     foreach my $k (qw(devid hostid status weight
-                      mb_total mb_used mb_asof mb_free)) {
+                      mb_total mb_used mb_asof mb_free utilization)) {
         $ret->{$k} = $dev->{$k};
     }
     return $ret;
+}
+
+sub set_weight {
+    my ($dev, $weight) = @_;
+    my $sto = Mgd::get_store();
+    $sto->set_device_weight($dev->id, $weight);
+    MogileFS::Device->invalidate_cache;
+}
+
+sub set_state {
+    my ($dev, $state) = @_;
+    die "Bogus state" unless $state =~ /^(?:alive|down|dead|readonly)$/;
+    my $sto = Mgd::get_store();
+    $sto->set_device_state($dev->id, $state);
+    MogileFS::Device->invalidate_cache;
+
+    # wake a reaper process up from sleep to get started as soon as possible
+    # on re-replication
+    MogileFS::ProcManager->wake_a("reaper") if $state eq "dead";
 }
 
 # --------------------------------------------------------------------------

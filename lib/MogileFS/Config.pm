@@ -2,6 +2,8 @@ package MogileFS::Config;
 use strict;
 require Exporter;
 use MogileFS::ProcManager;
+use Getopt::Long;
+use MogileFS::Store;
 
 our @ISA = qw(Exporter);
 our @EXPORT = qw($DEBUG config set_config);
@@ -14,10 +16,6 @@ $DEFAULT_MOG_ROOT = "/mnt/mogilefs";
 $MOGSTORED_STREAM_PORT = 7501;
 
 use constant DEVICE_SUMMARY_CACHE_TIMEOUT => 15;
-
-# this is incremented whenever the schema changes.  server will refuse
-# to start-up with an old schema version
-use constant SCHEMA_VERSION => 7;
 
 my %conf;
 sub set_config {
@@ -41,6 +39,7 @@ sub set_config_no_broadcast {
 }
 
 set_config("mogstored_stream_port" => $MOGSTORED_STREAM_PORT);
+set_config('default_mindevcount', 2);
 
 our (
     %cmdline,
@@ -66,7 +65,7 @@ our (
     $pidfile,
    );
 
-our $default_mindevcount;
+my $default_mindevcount;
 
 sub load_config {
     my $dummy_workerport;
@@ -152,7 +151,7 @@ sub load_config {
     $DEBUG          = choose_value( 'debug', $ENV{DEBUG} || 0 );
     $pidfile        = choose_value( 'pidfile', "" );
 
-    $default_mindevcount = choose_value( 'default_mindevcount', 2 );
+    choose_value( 'default_mindevcount', 2 );
     $node_timeout   = choose_value( 'node_timeout', 2 );
 
     $old_repl_compat = choose_value( 'old_repl_compat', 1 );
@@ -198,15 +197,19 @@ Please verify that you have correctly setup a configuration file or are
 providing the correct information in order to reach the database and try
 running the MogileFS server again.  If you haven\'t setup your database yet,
 run 'mogdbsetup'.
+
+Details: [sto=$sto, err=$@]
 }
     }
 
     my $sversion = MogileFS::Config->server_setting('schema_version') || 0;
-    unless ($sversion == SCHEMA_VERSION || MogileFS::Config->config('no_schema_check')) {
-        my $exp = SCHEMA_VERSION;
-        die "Server's database schema version of $sversion doesn't match expected value of $exp.  Halting.\n\n".
+    my $expect_ver = MogileFS::Store->latest_schema_version;
+    unless ($sversion == $expect_ver || MogileFS::Config->config('no_schema_check')) {
+        die "Server's database schema version of $sversion doesn't match expected value of $expect_ver.  Halting.\n\n".
             "Please run mogdbsetup to upgrade your schema.\n";
     }
+
+    $sto->pre_daemonize_checks;
 }
 
 # set_server_setting( key, value )

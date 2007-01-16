@@ -5,6 +5,7 @@ use strict;
 use base 'MogileFS::Worker';
 use fields (
             'fidtodo',   # hashref { fid => 1 }
+            'peerrepl',  # hashref { fid => time() } # when peer started replicating
             );
 
 use List::Util ();
@@ -21,7 +22,6 @@ my %fidfailure;
 
 # { fid => 1 }; used to keep track of fids we find in the unreachable_fids table
 my %unreachable;
-my $dbh;
 
 sub end_of_time { ENDOFTIME; }
 
@@ -30,6 +30,7 @@ sub new {
     my $self = fields::new($class);
     $self->SUPER::new($psock);
     $self->{fidtodo} = {};
+    $self->{peerrepl} = {};
     return $self;
 }
 
@@ -38,6 +39,12 @@ sub process_line {
 
     if ($$lineref =~ /^repl_was_done (\d+)/) {
         delete $self->{fidtodo}{$1};
+        return 1;
+    }
+
+    if ($$lineref =~ /^repl_starting (\d+)/) {
+        my $fidid = $1;
+        $self->note_peer_replicating($fidid);
         return 1;
     }
 
@@ -78,9 +85,12 @@ sub work {
         }
 
         $self->validate_dbh;
-        $dbh = $self->get_dbh or return 0;
+        my $dbh = $self->get_dbh or return 0;
 
         # update our unreachable fid list... we consider them good for 15 minutes
+        # FIXME: uh, what is this even used for nowadays?  it made more sense in mogilefs 1.x,
+        # so maybe we kinda need it for compatibility?  but maybe we could ditch it here and
+        # instead use the file_to_replicate table's row sat ENDOFTIME as meaning the same?
         my $urfids = $dbh->selectall_arrayref('SELECT fid, lastupdate FROM unreachable_fids');
         die $dbh->errstr if $dbh->err;
         foreach my $r (@{$urfids || []}) {
@@ -105,39 +115,31 @@ sub work {
     });
 }
 
+use constant REPLFETCH_LIMIT => 1000;
 sub replicate_using_torepl_table {
     my $self = shift;
 
     # find some fids to replicate, prioritize based on when they should be tried
-    my $LIMIT = 1000;
-    my $to_repl_map = $dbh->selectall_hashref(qq{
-        SELECT fid, fromdevid, failcount, flags, nexttry
-        FROM file_to_replicate
-        WHERE nexttry <= UNIX_TIMESTAMP()
-        ORDER BY nexttry
-        LIMIT $LIMIT
-    }, "fid");
-    if ($dbh->err) {
-        error("Database error selecting fids to replicate: " . $dbh->errstr);
-        return;
-    }
+    my $sto = Mgd::get_store();
+    my @to_repl = $sto->files_to_replicate(REPLFETCH_LIMIT)
+        or return;
 
     # get random list of hashref of things to do:
-    my $to_repl = [ List::Util::shuffle(values %$to_repl_map) ];
-    return unless @$to_repl;
+    @to_repl = List::Util::shuffle(@to_repl);
 
     # sort our priority list in terms of 0s (immediate, only 1 copy), 1s (immediate replicate,
     # but we already have 2 copies), and big numbers (unixtimestamps) of things that failed.
     # but because sort is stable, these are random within their 0/1/big classes.
-    @$to_repl = sort {
+    @to_repl = sort {
         ($a->{nexttry} < 1000 || $b->{nexttry} < 1000) ? ($a->{nexttry} <=> $b->{nexttry}) : 0
-    } @$to_repl;
+    } @to_repl;
 
-    foreach my $todo (@$to_repl) {
+    foreach my $todo (@to_repl) {
         my $fid = $todo->{fid};
+        next if $self->peer_is_replicating($fid);
 
         my $errcode;
-        my ($status, $unlock) = replicate($dbh, $fid,
+        my ($status, $unlock) = replicate($fid,
                                           errref       => \$errcode,
                                           no_unlock    => 1,   # to make it return an $unlock subref
                                           source_devid => $todo->{fromdevid},
@@ -151,7 +153,7 @@ sub replicate_using_torepl_table {
             # also replicated it), but in the case of running with old
             # replicators from previous versions, -or- simply if the
             # other guy's delete failed, this cleans it up....
-            $dbh->do("DELETE FROM file_to_replicate WHERE fid=?", undef, $fid);
+            $sto->delete_fid_from_file_to_replicate($fid);
             $unlock->() if $unlock;
             next;
         }
@@ -173,8 +175,6 @@ sub replicate_using_torepl_table {
         #
         # -- FATAL; DON'T TRY AGAIN --
         # no_source                  => it simply exists nowhere.  not that something's down, but file_on is empty.
-        # no_devices                 => no devices are configured.  at all.  why are we replicating something?
-        #                               how did something come into being since you can't delete devices?
 
         # bail if we failed getting the lock, that means someone else probably
         # already did it, so we should just move on
@@ -186,24 +186,23 @@ sub replicate_using_torepl_table {
         # logic for setting the next try time appropriately
         my $update_nexttry = sub {
             my ($type, $delay) = @_;
+            my $sto = Mgd::get_store();
             if ($type eq 'end_of_time') {
-                # special; update to a time that won't happen again, as we've encountered a scenario
-                # in which case we're really hosed
-                $dbh->do("UPDATE file_to_replicate SET nexttry = " . ENDOFTIME . ", failcount = failcount + 1 WHERE fid = ?",
-                         undef, $fid);
+                # special; update to a time that won't happen again,
+                # as we've encountered a scenario in which case we're
+                # really hosed
+                $sto->reschedule_file_to_replicate_absolute($fid, ENDOFTIME);
+            } elsif ($type eq "offset") {
+                $sto->reschedule_file_to_replicate_relative($fid, $delay+0);
             } else {
-                my $extra = $type eq 'offset' ? 'UNIX_TIMESTAMP() +' : '';
-                $dbh->do("UPDATE file_to_replicate SET nexttry = $extra ?, failcount = failcount + 1 WHERE fid = ?",
-                         undef, $delay+0, $fid);
+                $sto->reschedule_file_to_replicate_absolute($fid, $delay+0);
             }
-            error("Failed setting nexttry of fid $fid to $type $delay: " . $dbh->errstr)
-                if $dbh->err;
         };
 
         # now let's handle any error we want to consider a total failure; do not
         # retry at any point.  push this file off to the end so someone has to come
         # along and figure out what went wrong.
-        if ($errcode eq 'no_source' || $errcode eq 'no_devices') {
+        if ($errcode eq 'no_source') {
             $update_nexttry->( end_of_time => 1 );
             $unlock->() if $unlock;
             next;
@@ -222,6 +221,18 @@ sub replicate_using_torepl_table {
 sub replicate_using_devcounts {
     my $self = shift;
 
+    # this code path only exists for mogilefsd 1.x compatibility and
+    # is not needed in a pure-MogileFS 2.x environment.  and since you
+    # can't use non-MySQL in 1.x, it's pointless to port this code to
+    # the MogileFS::Store system to make it db portable.  so we just
+    # skip here if not using MySQL.
+    my $sto = Mgd::get_store();
+    return unless $sto->isa("MogileFS::Store::MySQL");
+
+    # call this $mdbh to indiciate it's a MySQL dbh, and to help grepping
+    # for old handles.  :)
+    my $mdbh = $sto->dbh;
+
     MogileFS::Class->foreach(sub {
         my $mclass = shift;
         my ($dmid, $classid, $min, $policy_class) = map { $mclass->$_ } qw(domainid classid mindevcount policy_class);
@@ -239,10 +250,10 @@ sub replicate_using_devcounts {
             my $now = time();
             $self->still_alive;
 
-            my $fids = $dbh->selectcol_arrayref("SELECT fid FROM file WHERE dmid=? AND classid=? ".
+            my $fids = $mdbh->selectcol_arrayref("SELECT fid FROM file WHERE dmid=? AND classid=? ".
                                                 "AND devcount = ? AND length IS NOT NULL ".
                                                 "LIMIT $LIMIT", undef, $dmid, $classid, $devcount);
-            die $dbh->errstr if $dbh->err;
+            die $mdbh->errstr if $mdbh->err;
             $self->{fidtodo}{$_} = 1 foreach @$fids;
 
             # increase devcount so we try to replicate the files at the next devcount
@@ -263,6 +274,7 @@ sub replicate_using_devcounts {
                 # now replicate this fid
                 $attempted++;
                 next unless $self->{fidtodo}{$fid};
+                next if $self->peer_is_replicating($fid);
 
                 if ($fidfailure{$fid}) {
                     if ($fidfailure{$fid} < $now) {
@@ -275,7 +287,7 @@ sub replicate_using_devcounts {
                 $self->read_from_parent;
                 $self->still_alive;
 
-                if (my $status = replicate($dbh, $fid, class => $mclass)) {
+                if (my $status = replicate($fid)) {
                     # $status is either 0 (failure, handled below), 1 (success, we actually
                     # replicated this file), or 2 (success, but someone else replicated it).
                     # so if it's 2, we just want to go to the next fid.  this file is done.
@@ -283,8 +295,8 @@ sub replicate_using_devcounts {
 
                     # if it was no longer reachable, mark it reachable
                     if (delete $unreachable{$fid}) {
-                        $dbh->do("DELETE FROM unreachable_fids WHERE fid = ?", undef, $fid);
-                        die $dbh->errstr if $dbh->err;
+                        $mdbh->do("DELETE FROM unreachable_fids WHERE fid = ?", undef, $fid);
+                        die $mdbh->errstr if $mdbh->err;
                     }
 
                     # housekeeping
@@ -313,9 +325,8 @@ sub replicate_using_devcounts {
 # README: if you update this sub to return a new error code, please update the
 # appropriate callers to know how to deal with the errors returned.
 sub replicate {
-    my ($dbh, $fid, %opts) = @_;
+    my ($fidid, %opts) = @_;
     my $errref    = delete $opts{'errref'};
-    my $mclass    = delete $opts{'class'};
     my $no_unlock = delete $opts{'no_unlock'};
     my $sdevid    = delete $opts{'source_devid'};
     die if %opts;
@@ -323,19 +334,11 @@ sub replicate {
     # bool:  if source was explicitly requested by caller
     my $fixed_source = $sdevid ? 1 : 0;
 
-    $mclass ||= MogileFS::Class->of_fid($fid);
+    my $fid    = MogileFS::FID->new($fidid);
 
-    my $policy_class = $mclass->policy_class;
-    eval "use $policy_class; 1;";
-    if ($@) {
-        return error("Failed to load policy class: $policy_class: $@");
-    }
-
-    my $lock;  # bool: whether we got the lock or not
-    my $lockname = "mgfs:fid:$fid:replicate";
+    my $sto = Mgd::get_store();
     my $unlock = sub {
-        $dbh->selectrow_array("SELECT RELEASE_LOCK(?)", undef, $lockname)
-            if $lock;
+        $sto->note_done_replicating($fidid);
     };
 
     my $retunlock = sub {
@@ -349,7 +352,14 @@ sub replicate {
         }
         $$errref = $errcode if $errref;
 
-        my $ret = $rv ? $rv : error($errmsg);
+        my $ret;
+        if ($errcode && $errcode eq "failed_getting_lock") {
+            # don't emit a warning with error() on lock failure.  not
+            # a big deal, don't scare people.
+            $ret = 0;
+        } else {
+            $ret = $rv ? $rv : error($errmsg);
+        }
         if ($no_unlock) {
             return ($ret, $unlock);
         } else {
@@ -358,25 +368,33 @@ sub replicate {
         }
     };
 
-    # hashref of devid -> $device_row_href  (where devid is alive)
-    my $devs = MogileFS::Device->map;
-    return $retunlock->(0, "no_devices", "Device information from get_device_summary is empty")
-        unless $devs && %$devs;
+    # hashref of devid -> MogileFS::Device
+    my $devs = MogileFS::Device->map
+        or die "No device map";
 
-    $lock = $dbh->selectrow_array("SELECT GET_LOCK(?, 1)", undef, $lockname);
-    return $retunlock->(0, "failed_getting_lock", "Unable to obtain lock $lockname")
-        unless $lock;
+    return $retunlock->(0, "failed_getting_lock", "Unable to obtain lock for fid $fidid")
+        unless $sto->should_begin_replicating_fidid($fidid);
+
+    MogileFS::Worker->send_to_parent("repl_starting $fidid");
+
+    # if the fid doesn't even exist, consider our job done!  no point
+    # replicating file contents of a file no longer in the namespace.
+    return $retunlock->(1) unless $fid->exists;
+
+    my $cls = $fid->class;
+    my $policy_class = $cls->policy_class;
+    eval "use $policy_class; 1;";
+    if ($@) {
+        return error("Failed to load policy class: $policy_class: $@");
+    }
 
     # learn what this devices file is already on
     my @on_devs;       # all devices fid is on, reachable or not.
     my @dead_devid;    # list of dead devids.  FIXME: do something with this?
     my @on_up_devid;   # subset of @on_devs:  just devs that are alive or readonly
 
-    my $sth = $dbh->prepare("SELECT devid FROM file_on WHERE fid=?");
-    $sth->execute($fid);
-    die $dbh->errstr if $dbh->err;
-    while (my ($devid) = $sth->fetchrow_array) {
-        my $d = $devs->{$devid};
+    foreach my $devid ($fid->devids) {
+        my $d = MogileFS::Device->of_devid($devid);
         push @on_devs, $d;
         unless ($d && $d->status =~ /^alive|readonly$/) {
             push @dead_devid, $devid;
@@ -385,8 +403,8 @@ sub replicate {
         push @on_up_devid, $devid;
     }
 
-    return $retunlock->(0, "no_source",   "Source is no longer available replicating $fid") if @on_devs == 0;
-    return $retunlock->(0, "source_down", "No alive devices available replicating $fid") if @on_up_devid == 0;
+    return $retunlock->(0, "no_source",   "Source is no longer available replicating $fidid") if @on_devs == 0;
+    return $retunlock->(0, "source_down", "No alive devices available replicating $fidid") if @on_up_devid == 0;
 
     # if they requested a specific source, that source must be up.
     if ($sdevid && ! grep { $_ == $sdevid} @on_up_devid) {
@@ -400,11 +418,11 @@ sub replicate {
     my $copy_err;
 
     while ($ddevid = $policy_class->replicate_to(
-                                                 fid       => $fid,
+                                                 fid       => $fidid,
                                                  on_devs   => \@on_devs, # all device objects fid is on, dead or otherwise
                                                  all_devs  => $devs,
                                                  failed    => \%dest_failed,
-                                                 min       => $mclass->mindevcount,
+                                                 min       => $cls->mindevcount,
                                                  ))
     {
         # they can return either a dev hashref/object or a devid number.  we want the number.
@@ -416,21 +434,21 @@ sub replicate {
         # the policy plugin is broken and we should terminate now.
         if ($dest_failed{$ddevid}) {
             return $retunlock->(0, "policy_error_doing_failed",
-                                "replication policy told us to do something we already told it we failed at while replicating fid $fid");
+                                "replication policy told us to do something we already told it we failed at while replicating fid $fidid");
         }
 
         # replication policy shouldn't tell us to put a file on a
         # device that it's already on.  that's just stupid.
         if (grep { $_->id == $ddevid } @on_devs) {
             return $retunlock->(0, "policy_error_already_there",
-                                "replication policy told us to put fid $fid on dev $ddevid, but it's already there!");
+                                "replication policy told us to put fid $fidid on dev $ddevid, but it's already there!");
         }
 
         # find where we're replicating from
         unless ($fixed_source) {
             # TODO: use an observed good device+host as source to start.
             my @choices = grep { ! $source_failed{$_} } @on_up_devid;
-            return $retunlock->(0, "source_down", "No devices available replicating $fid") unless @choices;
+            return $retunlock->(0, "source_down", "No devices available replicating $fidid") unless @choices;
             $sdevid = @choices[int(rand(scalar @choices))];
         }
 
@@ -438,7 +456,7 @@ sub replicate {
         my $rv = http_copy(
                            sdevid       => $sdevid,
                            ddevid       => $ddevid,
-                           fid          => $fid,
+                           fid          => $fidid,
                            expected_len => undef,  # FIXME: get this info to pass along
                            errref       => \$copy_err,
                            callback     => sub { $worker->still_alive; },
@@ -446,14 +464,14 @@ sub replicate {
         die "Bogus error code: $copy_err" if !$rv && $copy_err !~ /^(?:src|dest)_error$/;
 
         unless ($rv) {
-            error("Failed copying fid $fid from devid $sdevid to devid $ddevid (error type: $copy_err)");
+            error("Failed copying fid $fidid from devid $sdevid to devid $ddevid (error type: $copy_err)");
             if ($copy_err eq "src_error") {
                 $source_failed{$sdevid} = 1;
 
                 if ($fixed_source) {
                     # there can't be any more retries, as this source
                     # is busted and is the only one we wanted.
-                    return $retunlock->(0, "copy_error", "error copying fid $fid from devid $sdevid during replication");
+                    return $retunlock->(0, "copy_error", "error copying fid $fidid from devid $sdevid during replication");
                 }
 
             } else {
@@ -481,10 +499,38 @@ sub replicate {
     # "replicate to 6, but I don't like that, so don't count it as good"
 
     if ($got_copy_request) {
-        return $retunlock->(0, "copy_error", "errors copying fid $fid during replication");
+        return $retunlock->(0, "copy_error", "errors copying fid $fidid during replication");
     } else {
-        return $retunlock->(0, "policy_no_suggestions", "replication policy ran out of suggestions for us replicating fid $fid");
+        return $retunlock->(0, "policy_no_suggestions", "replication policy ran out of suggestions for us replicating fid $fidid");
     }
+}
+
+my $last_peerreplclean = 0;
+sub note_peer_replicating {
+    my ($self, $fidid) = @_;
+    my $now = time();
+    $self->{peerrepl}{$fidid} = $now;
+
+    # every minute, clean fids in this set older than 2 minutes
+    if ($now > $last_peerreplclean + 60) {
+        $last_peerreplclean = $now;
+        while (my ($k, $t) = each %{$self->{peerrepl}}) {
+            next if $t > $now - 120;
+            delete $self->{peerrepl}{$k};
+        }
+    }
+}
+
+# best effort optimization, doesn't have to be perfect (for instance,
+# doesn't currently know what peers on other hosts are doing, only
+# peer process).  just try to avoid lock contention trying to ask for
+# locks on replicating same files.  we say that if a file was started
+# by a peer in last 60 seconds, it's still being replicated.
+sub peer_is_replicating {
+    my ($self, $fidid) = @_;
+    my $t = $self->{peerrepl}{$fidid} or return 0;
+    my $rv = ($t > time() - 60);
+    return $rv;
 }
 
 # copies a file from one Perlbal to another utilizing HTTP
@@ -508,10 +554,7 @@ sub http_copy {
         my $worker = MogileFS::ProcManager->is_child;
         $worker->send_to_parent(":repl_unreachable $fid");
 
-        # update database table
-        Mgd::validate_dbh();
-        my $dbh = Mgd::get_dbh();
-        $dbh->do("REPLACE INTO unreachable_fids VALUES ($fid, UNIX_TIMESTAMP())");
+        MogileFS::FID->new($fid)->mark_unreachable;
 
         $$errref = "src_error" if $errref;
         return error("Fid $fid unreachable while replicating: $_[0]");
@@ -631,3 +674,26 @@ sub http_copy {
 # c-basic-indent: 4
 # indent-tabs-mode: nil
 # End:
+
+__END__
+
+=head1 NAME
+
+MogileFS::Worker::Replicate -- replicates files
+
+=head1 OVERVIEW
+
+This process replicates files enqueued in B<file_to_replicate> table.
+
+The replication policy (which devices to replicate to) is pluggable,
+but only one policy comes with the server.  See
+L<MogileFS::ReplicationPolicy::MultipleHosts>
+
+=head1 SEE ALSO
+
+L<MogileFS::Worker>
+
+L<MogileFS::ReplicationPolicy>
+
+L<MogileFS::ReplicationPolicy::MultipleHosts>
+

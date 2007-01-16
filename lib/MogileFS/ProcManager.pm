@@ -4,6 +4,8 @@ use warnings;
 use POSIX qw(:sys_wait_h sigprocmask SIGINT SIG_BLOCK SIG_UNBLOCK);
 use Symbol;
 use Socket;
+use MogileFS::Connection::Client;
+use MogileFS::Connection::Worker;
 
 # This class handles keeping lists of workers and clients and
 # assigning them to eachother when things happen.  You don't actually
@@ -565,11 +567,17 @@ sub HandleChildRequest {
         MogileFS::ProcManager->ImmediateSendToChildrenByJob('replicate', "repl_unreachable $1", $child);
 
     } elsif ($cmd =~ /^repl_i_did (\d+)/) {
-        my $fid = $1;
+        my $fidid = $1;
 
         # announce to the other replicators that this fid was done and then drain the
         # queue to this person.
-        MogileFS::ProcManager->ImmediateSendToChildrenByJob('replicate', "repl_was_done $fid", $child);
+        MogileFS::ProcManager->ImmediateSendToChildrenByJob('replicate', "repl_was_done $fidid", $child);
+
+    } elsif ($cmd =~ /^repl_starting (\d+)/) {
+        my $fidid = $1;
+
+        # announce to the other replicators that this fid is starting to be replicated
+        MogileFS::ProcManager->ImmediateSendToChildrenByJob('replicate', "repl_starting $fidid", $child);
 
     } elsif ($cmd eq ":ping") {
 
@@ -588,14 +596,22 @@ sub HandleChildRequest {
     } elsif ($cmd eq ":monitor_just_ran") {
         send_monitor_has_run($child);
 
+    } elsif ($cmd =~ /^:wake_a (\w+)$/) {
+
+        MogileFS::ProcManager->wake_a($1, $child);
+
     } elsif ($cmd =~ /^:invalidate_meta (\w+)/) {
-        send_invalidate($1, $child);
+
+        my $what = $1;
+        MogileFS::ProcManager->send_to_all_children(":invalidate_meta_once $what", $child);
 
     } elsif ($cmd =~ /^:set_config_from_child (\S+) (.+)/) {
         # and this will rebroadcast it to all other children
         # (including the one that just set it to us, but eh)
         MogileFS::Config->set_config($1, $2);
-
+    } elsif (my ($devid, $util) = $cmd =~ /^:set_dev_utilization (\d+) (.+)/) {
+        # rebroadcast dev utilization messages to all children
+        MogileFS::ProcManager->send_to_all_children(":set_dev_utilization $devid $util");
     } else {
         # unknown command
         my $show = $cmd;
@@ -614,10 +630,12 @@ sub HandleChildRequest {
 #
 # doesn't add to queue of things child gets on next interactive command: writes immediately
 # (won't get in middle of partial write, though, as danga::socket queues things up)
+#
+# if $just_one is specified, only a single process is notified, then we stop.
 sub ImmediateSendToChildrenByJob {
-    my ($class, $dest_class, $msg, $exclude_child) = @_;
+    my ($pkg, $class, $msg, $exclude_child, $just_one) = @_;
 
-    my $childref = $ChildrenByJob{$dest_class};
+    my $childref = $ChildrenByJob{$class};
     return 0 unless defined $childref && %$childref;
 
     foreach my $child (values %$childref) {
@@ -626,6 +644,7 @@ sub ImmediateSendToChildrenByJob {
 
         # send the message to this child
         $child->write("$msg\r\n");
+        return 1 if $just_one;
     }
     return scalar(keys %$childref);
 }
@@ -673,27 +692,24 @@ sub is_child {
 
 sub state_change {
     my ($what, $whatid, $state, $child) = @_;
-    #warn "STATE CHANGE: $what<$whatid> = $state\n";
-    # TODO: can probably send this to all children now, not just certain types
-    for my $type (qw(queryworker replicate delete monitor checker)) {
-        MogileFS::ProcManager->ImmediateSendToChildrenByJob($type, ":state_change $what $whatid $state", $child);
+    MogileFS::ProcManager->send_to_all_children(":state_change $what $whatid $state", $child);
+}
+
+sub wake_a {
+    my ($pkg, $class, $fromchild) = @_;  # from arg is optional (which child sent it)
+    my $child = MogileFS::ProcManager->is_child;
+    if ($child) {
+        $child->wake_a($class);
+    } else {
+        MogileFS::ProcManager->ImmediateSendToChildrenByJob($class, ":wake_up", $fromchild, "just_one");
     }
 }
 
 sub send_to_all_children {
-    shift if @_ == 2;
-    my $msg = shift;
-
+    my ($pkg, $msg, $exclude) = @_;
     foreach my $child (values %child) {
+        next if $exclude && $child == $exclude;
         $child->write("$msg\r\n");
-    }
-}
-
-sub send_invalidate {
-    my ($what, $child) = @_;
-    # TODO: can probably send this to all children now, not just certain types
-    for my $type (qw(queryworker replicate delete monitor checker)) {
-        MogileFS::ProcManager->ImmediateSendToChildrenByJob($type, ":invalidate_meta_once $what", $child);
     }
 }
 

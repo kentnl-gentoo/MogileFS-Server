@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 #   Perl Makefile for Danga-Socket
-#   $Id: Makefile.PL 580 2006-12-29 06:02:36Z bradfitz $
+#   $Id: Makefile.PL 711 2007-01-16 21:33:25Z bradfitz $
 #
 #   Invoke with 'perl Makefile.PL'
 #
@@ -17,7 +17,7 @@ $exefiles = ["mogilefsd"] if exists $ENV{DANGABUILD_MOGILEFSDONLY};
 
 WriteMakefile(
     NAME                    => 'mogilefs-server',
-    VERSION                 => '2.00_04',
+    VERSION                 => '2.00_05',
     AUTHOR                  => 'Brad Fitzpatrick <brad@danga.com>',
     ABSTRACT                => 'MogileFS server components',
     EXE_FILES               => $exefiles,

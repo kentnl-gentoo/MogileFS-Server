@@ -8,6 +8,13 @@ my %singleton;        # hostid -> instance
 my $last_load = 0;    # unixtime of last 'reload_hosts'
 my $all_loaded = 0;   # bool: have we loaded all the hosts?
 
+# returns MogileFS::Host object, or throws 'dup' error
+sub create {
+    my ($pkg, $hostname, $ip) = @_;
+    my $hid = Mgd::get_store()->create_host($hostname, $ip);
+    return MogileFS::Host->of_hostid($hid);
+}
+
 sub of_hostid {
     my ($class, $hostid) = @_;
     return undef unless $hostid;
@@ -57,11 +64,8 @@ sub reload_hosts {
         $host->{_loaded} = 0;
     }
 
-    my $dbh = Mgd::get_dbh();
-    my $sth = $dbh->prepare("SELECT /*!40000 SQL_CACHE */ hostid, status, hostname, " .
-                            "hostip, http_port, http_get_port, altip, altmask FROM host");
-    $sth->execute;
-    while (my $row = $sth->fetchrow_hashref) {
+    my $sto = Mgd::get_store();
+    foreach my $row ($sto->get_all_hosts) {
         die unless $row->{status} =~ /^\w+$/;
         my $ho =
             MogileFS::Host->of_hostid($row->{hostid});
@@ -126,11 +130,28 @@ sub observed_unreachable {
     return $host->{observed_state} && $host->{observed_state} eq "unreachable";
 }
 
+sub set_status        { shift->_set_field("status",        @_); }
+sub set_ip            { shift->_set_field("hostip",        @_); } # throws 'dup'
+sub set_http_port     { shift->_set_field("http_port",     @_); }
+sub set_http_get_port { shift->_set_field("http_get_port", @_); }
+sub set_alt_ip        { shift->_set_field("altip",         @_); }
+sub set_alt_mask      { shift->_set_field("altmask",       @_); }
+
+sub _set_field {
+    my ($self, $field, $val) = @_;
+    # $field is both the database column field and our member keys
+    $self->_load;
+    return 1 if $self->{$field} eq $val;
+    return 0 unless Mgd::get_store()->update_host_property($self->id, $field, $val);
+    $self->{$field} = $val;
+    MogileFS::Host->invalidate_cache;
+    return 1;
+}
+
 sub http_port {
     my $host = shift;
     $host->_load;
     return $host->{http_port};
-
 }
 
 sub http_get_port {
@@ -164,6 +185,12 @@ sub status {
     return $host->{status};
 }
 
+sub hostname {
+    my $host = shift;
+    $host->_load;
+    return $host->{hostname};
+}
+
 sub is_marked_down {
     my $host = shift;
     die "FIXME";
@@ -184,6 +211,13 @@ sub overview_hashref {
         $ret->{$k} = $host->{$k};
     }
     return $ret;
+}
+
+sub delete {
+    my $host = shift;
+    my $rv = Mgd::get_store()->delete_host($host->id);
+    MogileFS::Host->invalidate_cache;
+    return $rv;
 }
 
 # --------------------------------------------------------------------------
