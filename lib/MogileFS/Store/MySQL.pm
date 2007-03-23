@@ -28,6 +28,7 @@ sub init {
     my $self = shift;
     $self->SUPER::init;
     $self->{lock_depth} = 0;
+    $self->{slave_next_check} = 0;
 }
 
 sub post_dbi_connect {
@@ -58,9 +59,66 @@ sub can_insertignore { 1 }
 sub can_insert_multi { 1 }
 sub unix_timestamp { "UNIX_TIMESTAMP()" }
 
+sub filter_create_sql {
+    my ($self, $sql) = @_;
+    return $sql unless $self->fid_type eq "BIGINT";
+    $sql =~ s!\bfid\s+INT\b!fid BIGINT!i;
+    return $sql;
+}
+
+sub can_do_slaves { 1 }
+
+sub check_slave {
+    my $self = shift;
+
+    return 0 unless $self->{slave};
+
+    my $next_check = \$self->{slave_next_check};
+
+    if ($$next_check > time()) {
+        return 1;
+    }
+
+    my $master_status = eval { $self->dbh->selectrow_hashref("SHOW MASTER STATUS") };
+    warn "Error thrown: '$@' while trying to get master status." if $@;
+
+    my $slave_status = eval { $self->{slave}->dbh->selectrow_hashref("SHOW SLAVE STATUS") };
+    warn "Error thrown: '$@' while trying to get slave status." if $@;
+
+    # compare contrast, return 0 if not okay.
+    # Master: File Position
+    # Slave: 
+
+    # call time() again here because SQL blocks.
+    $$next_check = time() + 5;
+
+    return 1;
+}
+
 # --------------------------------------------------------------------------
 # Functions specific to Store::MySQL subclass.  Not in parent.
 # --------------------------------------------------------------------------
+
+sub fid_type {
+    my $self = shift;
+    return $self->{_fid_type} if $self->{_fid_type};
+
+    # let people force bigint mode with environment.
+    if ($ENV{MOG_FIDSIZE} && $ENV{MOG_FIDSIZE} eq "big") {
+        return $self->{_fid_type} = "BIGINT";
+    }
+
+    # else, check a maybe-existing table and see if we're in bigint
+    # mode already.
+    my $dbh = $self->dbh;
+    my $create = eval { $dbh->selectrow_array("SHOW CREATE TABLE file") };
+    if ($create && $create =~ /\bbigint\b/i) {
+        return $self->{_fid_type} = "BIGINT";
+    }
+
+    # else, use 32-bit ints for the fid type
+    return $self->{_fid_type} = "INT";
+}
 
 # attempt to grab a lock of lockname, and timeout after timeout seconds.
 # returns 1 on success and 0 on timeout
@@ -106,6 +164,9 @@ sub new_temp {
     my $dbname = "tmp_mogiletest";
     _create_mysql_db($dbname);
 
+    # allow MyISAM in the test suite.
+    $ENV{USE_UNSAFE_MYSQL} = 1 unless defined $ENV{USE_UNSAFE_MYSQL};
+
     system("$FindBin::Bin/../mogdbsetup", "--yes", "--dbname=$dbname")
         and die "Failed to run mogdbsetup ($FindBin::Bin/../mogdbsetup).";
 
@@ -131,6 +192,45 @@ sub _drop_mysql_db {
     _root_dbh()->do("DROP DATABASE IF EXISTS $dbname");
 }
 
+# --------------------------------------------------------------------------
+# Database creation time things we override
+# --------------------------------------------------------------------------
+
+sub create_table {
+    my $self = shift;
+    my ($table) = @_;
+
+    my $dbh = $self->dbh;
+    my $errmsg =
+        "InnoDB backend is unavailable for use, force creation of tables " .
+        "by setting USE_UNSAFE_MYSQL=1 in your environment and run this " .
+        "command again.";
+
+    unless ($ENV{USE_UNSAFE_MYSQL}) {
+        my $engines = eval { $dbh->selectall_hashref("SHOW ENGINES", "Engine"); };
+        warn "error = [$@]\n";
+        if ($@ && $dbh->err == 1064) {
+            # syntax error?  for MySQL 4.0.x.
+            # who cares.  we'll catch it below on the double-check.
+        } else {
+            die $errmsg
+                unless ($engines->{InnoDB} and $engines->{InnoDB}->{Support} eq 'YES');
+        }
+    }
+
+    $self->SUPER::create_table(@_);
+
+    return if $ENV{USE_UNSAFE_MYSQL};
+
+    $dbh->do("ALTER TABLE $table TYPE=InnoDB");
+    warn "DBI reported an error of: '" . $dbh->errstr . "' when trying to " .
+         "alter table type of $table to InnoDB\n" if $dbh->err;
+
+    my $table_status = $dbh->selectrow_hashref("SHOW TABLE STATUS LIKE '$table'");
+
+    die "MySQL didn't change table type to InnoDB as requested.\n\n$errmsg"
+        unless $table_status->{Engine} eq 'InnoDB';
+}
 
 # --------------------------------------------------------------------------
 # Data-access things we override

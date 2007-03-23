@@ -1,3 +1,4 @@
+CHANGES
 CHANGES.mogilefsd
 CHANGES.mogstored
 MANIFEST
@@ -5,6 +6,7 @@ META.yml			Module meta-data (added by MakeMaker)
 Makefile.PL
 TODO
 doc/fsck-notes.txt
+doc/memcache-support.txt
 lib/MogileFS/Class.pm
 lib/MogileFS/Config.pm
 lib/MogileFS/Connection/Client.pm
@@ -39,6 +41,8 @@ mogautomount
 mogdbsetup
 mogilefsd
 mogstored
+mogstored-diskusage
+mogstored-iostat
 t/00-startup.t
 t/10-weighting.t
 t/domains-classes.t

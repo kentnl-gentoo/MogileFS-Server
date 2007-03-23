@@ -141,6 +141,7 @@ sub PostEventLoopChecker {
             my $extra = $todie{$pid} ? "expected" : "UNEXPECTED";
             error("Child $pid ($job) died: $? ($extra)");
             MogileFS::ProcManager->NoteDeadChild($pid);
+            $jobconn->close;
 
             if (my $jobstat = $jobs{$job}) {
                 # if the pid is in %todie, then we have asked it to shut down
@@ -446,8 +447,12 @@ sub HandleQueryWorkerResponse {
     }
 
     # now, if it doesn't match
-    unless ($id eq "$worker->{pid}-$worker->{reqid}") {
-        Mgd::error("Worker responded with id $id, expected $worker->{pid}-$worker->{reqid}, killing");
+    unless ($id && $id eq "$worker->{pid}-$worker->{reqid}") {
+        $id   = "<undef>" unless defined $id;
+        $line = "<undef>" unless defined $line;
+        $line =~ s/\n/\\n/g;
+        $line =~ s/\r/\\r/g;
+        Mgd::error("Worker responded with id $id (line: [$line]), but expected id $worker->{pid}-$worker->{reqid}, killing");
         $client->close('worker_mismatch');
         return MogileFS::ProcManager->AskWorkerToDie($worker);
     }
@@ -508,6 +513,7 @@ sub SendHelp {
     $client->write(<<HELP);
 Mogilefsd admin commands:
 
+    !version    Server version
     !recent     Recently executed queries and how long they took.
     !queue      Queries that are pending execution.
     !stats      General stats on what we\'re up to.
@@ -516,6 +522,7 @@ Mogilefsd admin commands:
     !shutdown   Immediately kill all of mogilefsd.
 
     !replication
+                (Deprecated/old)
                 See the replication status for unreplicated files.
                 Output format:
                 <domain> <class> <devcount> <files>
@@ -658,8 +665,11 @@ sub NoteDeadWorkerConn {
     my MogileFS::Connection::Worker $worker = $_[1];
     return unless $worker;
 
+    my $fd = $worker->{fd};
+    return unless defined($fd);
+
     # if there's a mapping for this worker's fd, they had a job that didn't get done
-    if ($Mappings{$worker->{fd}}) {
+    if ($Mappings{$fd}) {
         # unshift, since this one already went through the queue once
         unshift @PendingQueries, $Mappings{$worker->{fd}};
         delete $Mappings{$worker->{fd}};

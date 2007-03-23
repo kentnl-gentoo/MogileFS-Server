@@ -36,6 +36,8 @@ sub new_from_dsn_user_pass {
         user   => $user,
         pass   => $pass,
         raise_errors => $subclass->want_raise_errors,
+        slave_list_cachetime => 0,
+        slave_list_cache     => [],
     }, $subclass;
     $self->init;
     return $self;
@@ -84,9 +86,11 @@ sub new_from_mogdbsetup {
     die "Failed to connect to database as regular user, even after creating it and setting up permissions as the root user.";
 }
 
+# given a root DBI connection, create the named database.  succeed
+# if it it's made, or already exists.  die otherwise.
 sub create_db_if_not_exists {
     my ($pkg, $rdbh, $dbname) = @_;
-    $rdbh->do("CREATE DATABASE $dbname")
+    $rdbh->do("CREATE DATABASE IF NOT EXISTS $dbname")
         or die "Failed to create database '$dbname': " . $rdbh->errstr . "\n";
 }
 
@@ -134,6 +138,94 @@ sub pass { $_[0]{pass} }
 
 sub init { 1 }
 sub post_dbi_connect { 1 }
+
+sub can_do_slaves { 0 }
+
+sub mark_as_slave {
+    my $self = shift;
+    die "Incapable of becoming slave." unless $self->can_do_slaves;
+
+    $self->{slave} = 1;
+}
+
+sub is_slave {
+    my $self = shift;
+    return $self->{slave};
+}
+
+# Returns a list of arrayrefs, each being [$dsn, $username, $password] for connecting to a slave DB.
+sub _slaves_list {
+    my $self = shift;
+    my $now = time();
+
+    # only reload every 15 seconds.
+    if ($self->{slave_list_cachetime} > $now - 15) {
+        return @{$self->{slave_list_cache}};
+    }
+    $self->{slave_list_cachetime} = $now;
+    $self->{slave_list_cache}     = [];
+
+    my $sk = MogileFS::Config->server_setting('slave_keys')
+        or return ();
+
+    my @ret;
+    foreach my $key (split /\s*,\s*/, $sk) {
+        my $slave = MogileFS::Config->server_setting("slave_$key");
+        my ($dsn, $user, $pass) = split /\|/, $slave;
+        push @ret, [$dsn, $user, $pass];
+    }
+
+    $self->{slave_list_cache}     = \@ret;
+    return @ret;
+}
+
+sub get_slave {
+    my $self = shift;
+
+    die "Incapable of having slaves." unless $self->can_do_slaves;
+
+    return $self->{slave} if $self->check_slave;
+
+    my @slaves_list = $self->_slaves_list;
+
+    # If we have no slaves, then return silently.
+    return unless @slaves_list;
+
+    foreach my $slave_fulldsn (@slaves_list) {
+        my $newslave = $self->{slave} = $self->new_from_dsn_user_pass(@$slave_fulldsn);
+        $self->{slave_next_check} = 0;
+        $newslave->mark_as_slave;
+        return $newslave
+            if $self->check_slave;
+    }
+
+    warn "Slave list exhausted, failing back to master.";
+    return;
+}
+
+sub read_store {
+    my $self = shift;
+
+    return $self unless $self->can_do_slaves;
+
+    if ($self->{slave_ok}) {
+        my $slave = $self->get_slave;
+        return $slave if $slave;
+    }
+
+    return $self;
+}
+
+sub slaves_ok {
+    my $self = shift;
+    my $coderef = shift;
+
+    return unless ref $coderef eq 'CODE';
+
+    local $self->{slave_ok} = 1;
+
+    return $coderef->(@_);
+}
 
 sub recheck_dbh {
     my $self = shift;
@@ -227,6 +319,13 @@ sub insert_ignore {
 
 # --------------------------------------------------------------------------
 
+my @extra_tables;
+
+sub add_extra_tables {
+    my $class = shift;
+    push @extra_tables, @_;
+}
+
 sub setup_database {
     my $sto = shift;
 
@@ -253,7 +352,7 @@ sub setup_database {
                       unreachable_fids file_on file_on_corrupt host
                       device server_settings file_to_replicate
                       file_to_delete_later
-                      )) {
+                      ), @extra_tables) {
         $sto->create_table($t);
     }
 

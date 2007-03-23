@@ -51,6 +51,7 @@ our (
     $db_user,
     $db_pass,
     $conf_port,
+    $listen,
     $query_jobs,
     $delete_jobs,
     $replicate_jobs,
@@ -83,6 +84,7 @@ sub load_config {
                              'user=s'        => \$cmdline{user},
                              'r|mogroot=s'   => \$cmdline{mog_root},
                              'p|confport=i'  => \$cmdline{conf_port},
+                             'l|listen=s@'   => \$cmdline{listen},
                              'w|workers=i'   => \$cmdline{query_jobs},
                              'no_http'       => \$cmdline{no_http},  # OLD, we just eat it to shut it up.
                              'workerport=i'  => \$dummy_workerport,  # eat it for backwards compat
@@ -162,6 +164,14 @@ sub load_config {
     load_plugins($cfgfile{plugins}) if $cfgfile{plugins};
 
     choose_value('user', '');
+
+    # fix up config file listen option
+    $cfgfile{listen} = [ split(/\s*,\s*/, $cfgfile{listen}) ] if defined $cfgfile{listen};
+
+    # now let's fix up the listen option to include the port if it doesn't already; we can't use
+    # choose_value as that uses set_config and that sends to children; this option doesn't apply
+    my $temp_listen = $cmdline{listen} || $cfgfile{listen} || [ '0.0.0.0' ];
+    $conf{listen} = $listen = [ map { /:/ ? $_ : "$_:$conf{conf_port}" } @$temp_listen ];
 }
 
 ### FUNCTION: choose_value( $name, $default )
@@ -231,6 +241,24 @@ sub server_setting {
     return Mgd::get_store()->server_setting($key);
 }
 
+
+my $memc;
+my $last_memc_server_fetch = 0;
+my $have_memc_module = eval "use Cache::Memcached; 1;";
+sub memcache_client {
+    return undef unless $have_memc_module;
+    $memc ||= Cache::Memcached->new;
+
+    # only reload the server list every 30 seconds
+    my $now = time();
+    return $memc if $last_memc_server_fetch > $now - 30;
+
+    my @servers = split(/\s*,\s*/, MogileFS::Config->server_setting("memcache_servers") || "");
+    $memc->set_servers(\@servers);
+    $last_memc_server_fetch = $now;
+
+    return $memc;
+}
 
 1;
 

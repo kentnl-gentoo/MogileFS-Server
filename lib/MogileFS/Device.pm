@@ -385,7 +385,7 @@ sub create_directory {
         return 1;
     }
 
-    return 0 unless $ans =~ m!^HTTP/1.[01] 2\d\d!;
+    return 0 unless $ans && $ans =~ m!^HTTP/1.[01] 2\d\d!;
 
     my $now = time();
     $dir_made{$uri} = $now;
@@ -440,7 +440,7 @@ sub overview_hashref {
     $dev->_load;
 
     my $ret = {};
-    foreach my $k (qw(devid hostid status weight
+    foreach my $k (qw(devid hostid status weight observed_state
                       mb_total mb_used mb_asof mb_free utilization)) {
         $ret->{$k} = $dev->{$k};
     }
