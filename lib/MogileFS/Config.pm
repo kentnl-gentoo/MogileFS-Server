@@ -4,6 +4,7 @@ require Exporter;
 use MogileFS::ProcManager;
 use Getopt::Long;
 use MogileFS::Store;
+use Sys::Hostname ();
 
 our @ISA = qw(Exporter);
 our @EXPORT = qw($DEBUG config set_config);
@@ -57,7 +58,6 @@ our (
     $replicate_jobs,
     $reaper_jobs,
     $monitor_jobs,
-    $checker_jobs,
     $mog_root,
     $min_free_space,
     $max_disk_age,
@@ -95,6 +95,7 @@ sub load_config {
                              'pidfile=s'      => \$cmdline{pidfile},
                              'no_schema_check' => \$cmdline{no_schema_check},
                              'old_repl_compat=i' => \$cmdline{old_repl_compat},
+                             'plugins=s@'        => \$cmdline{plugins},
                              );
 
     # warn of old/deprecated options
@@ -147,7 +148,6 @@ sub load_config {
     $replicate_jobs = choose_value( 'replicate_jobs', 1 );
     $reaper_jobs    = choose_value( 'reaper_jobs', 1 );
     $monitor_jobs   = choose_value( 'monitor_jobs', 1 );
-    $checker_jobs   = choose_value( 'checker_jobs', 1 );
     $min_free_space = choose_value( 'min_free_space', 100 );
     $max_disk_age   = choose_value( 'max_disk_age', 5 );
     $DEBUG          = choose_value( 'debug', $ENV{DEBUG} || 0 );
@@ -161,7 +161,13 @@ sub load_config {
     choose_value( 'no_schema_check', 0 );
 
     # now load plugins
-    load_plugins($cfgfile{plugins}) if $cfgfile{plugins};
+    my @plugins;
+    push @plugins, $cfgfile{plugins}    if $cfgfile{plugins};
+    push @plugins, @{$cmdline{plugins}} if $cmdline{plugins};
+
+    foreach my $plugin (@plugins) {
+        load_plugins($plugin);
+    }
 
     choose_value('user', '');
 
@@ -258,6 +264,10 @@ sub memcache_client {
     $last_memc_server_fetch = $now;
 
     return $memc;
+}
+
+sub hostname {
+    return Sys::Hostname::hostname();
 }
 
 1;

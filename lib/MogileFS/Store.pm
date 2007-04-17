@@ -331,11 +331,12 @@ sub setup_database {
 
     # schema history:
     #   7: adds file_to_delete_later table
+    #   6: adds file_to_replicate table
     my $curver = $sto->schema_version;
 
     my $latestver = SCHEMA_VERSION;
     if ($curver == $latestver) {
-        status("Schema already up-to-date at version $curver.");
+        $sto->status("Schema already up-to-date at version $curver.");
         return 1;
     }
 
@@ -344,7 +345,7 @@ sub setup_database {
     }
 
     if ($curver) {
-        confirm("Install/upgrade your schema from version $curver to version $latestver?");
+        $sto->confirm("Install/upgrade your schema from version $curver to version $latestver?");
     }
 
     foreach my $t (qw(
@@ -998,8 +999,20 @@ sub get_fidids_by_device {
     my $dbh = $self->dbh;
     my $fidids = $dbh->selectcol_arrayref("SELECT fid FROM file_on WHERE devid = ? LIMIT $limit",
                                           undef, $devid);
-    die "Error selecting jobs to reap: " . $dbh->errstr if $dbh->err;
     return $fidids;
+}
+
+# takes two arguments, fidid to be above, and optional limit (default 1,000).  returns up to that
+# that many fidids above the provided fidid.  returns array of (sorted) fid ids.
+sub get_fidids_above {
+    my ($self, $fidid, $limit) = @_;
+    $limit ||= 1000;
+    $limit = int($limit);
+
+    my $dbh = $self->dbh;
+    my $fidids = $dbh->selectcol_arrayref("SELECT fid FROM file WHERE fid > ? ORDER BY fid LIMIT $limit",
+                                          undef, $fidid);
+    return @$fidids;
 }
 
 # creates a new domain, given a domain namespace string.  return the dmid on success,

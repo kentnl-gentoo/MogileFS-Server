@@ -85,7 +85,7 @@ sub set_min_workers {
 sub job_to_class_suffix {
     my ($class, $job) = @_;
     return {
-        checker     => "Checker",
+        fsck        => "Fsck",
         queryworker => "Query",
         delete      => "Delete",
         replicate   => "Replicate",
@@ -725,7 +725,7 @@ sub send_to_all_children {
 
 sub send_monitor_has_run {
     my $child = shift;
-    for my $type (qw(replicate checker queryworker delete)) {
+    for my $type (qw(replicate fsck queryworker delete)) {
         MogileFS::ProcManager->ImmediateSendToChildrenByJob($type, ":monitor_has_run", $child);
     }
 }

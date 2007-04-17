@@ -1,6 +1,4 @@
 CHANGES
-CHANGES.mogilefsd
-CHANGES.mogstored
 MANIFEST
 META.yml			Module meta-data (added by MakeMaker)
 Makefile.PL
@@ -20,7 +18,6 @@ lib/MogileFS/HTTPFile.pm
 lib/MogileFS/Host.pm
 lib/MogileFS/IOStatWatcher.pm
 lib/MogileFS/Overview.pm
-lib/MogileFS/Plugin/FilePaths.pm
 lib/MogileFS/ProcManager.pm
 lib/MogileFS/ReplicationPolicy/MultipleHosts.pm
 lib/MogileFS/Server.pm
@@ -30,7 +27,6 @@ lib/MogileFS/Store/SQLite.pm
 lib/MogileFS/Sys.pm
 lib/MogileFS/Util.pm
 lib/MogileFS/Worker.pm
-lib/MogileFS/Worker/Checker.pm
 lib/MogileFS/Worker/Delete.pm
 lib/MogileFS/Worker/Fsck.pm
 lib/MogileFS/Worker/Monitor.pm
@@ -45,6 +41,7 @@ mogstored-diskusage
 mogstored-iostat
 t/00-startup.t
 t/10-weighting.t
+t/20-filepaths.t
 t/domains-classes.t
 t/hosts-devices.t
 t/lib/mogtestlib.pl
