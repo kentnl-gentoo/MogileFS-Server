@@ -361,9 +361,11 @@ sub cmd_create_close {
     # get size of file and verify that it matches what we were given, if anything
     my $size = MogileFS::HTTPFile->at($path)->size;
 
-    if ($args->{size} > 0 && $size == 0) {
+    if ($args->{size} > 0 && ! $size) {
+        # size is either: 0 (file doesn't exist) or undef (host unreachable)
+        my $type    = defined $size ? "missing" : "cantreach";
         my $lasterr = MogileFS::Util::last_error();
-        return $self->err_line("size_verify_error", "Expected: $args->{size}; actual: 0 (error); path: $path; error: $lasterr")
+        return $self->err_line("size_verify_error", "Expected: $args->{size}; actual: 0 ($type); path: $path; error: $lasterr")
     }
 
     return $self->err_line("size_mismatch", "Expected: $args->{size}; actual: $size; path: $path")
@@ -1135,6 +1137,114 @@ sub cmd_do_monitor_round {
     $self->forget_that_monitor_has_run;
     $self->wait_for_monitor;
     return $self->ok_line;
+}
+
+sub cmd_fsck_start {
+    my MogileFS::Worker::Query $self = shift;
+    my $sto = Mgd::get_store();
+
+    # reset position, if a previous fsck was already completed.
+    my $intss       = sub { MogileFS::Config->server_setting($_[0]) || 0 };
+    my $checked_fid = $intss->("fsck_highest_fid_checked");
+    my $final_fid   = $intss->("fsck_fid_at_end");
+    if ($checked_fid && $final_fid && $checked_fid >= $final_fid) {
+        $self->_do_fsck_reset or return $self->err_line;
+    }
+
+    # set params for stats:
+    $sto->set_server_setting("fsck_start_time", $sto->get_db_unixtime);
+    $sto->set_server_setting("fsck_stop_time", undef);
+    $sto->set_server_setting("fsck_fids_checked", 0);
+    my $start_fid =
+        MogileFS::Config->server_setting('fsck_highest_fid_checked') || 0;
+    $sto->set_server_setting("fsck_start_fid", $start_fid);
+
+    # and start it:
+    $sto->set_server_setting("fsck_host", MogileFS::Config->hostname);
+    MogileFS::ProcManager->wake_a("fsck");
+
+    return $self->ok_line;
+}
+
+sub cmd_fsck_stop {
+    my MogileFS::Worker::Query $self = shift;
+    my $sto = Mgd::get_store();
+    $sto->set_server_setting("fsck_host", undef);
+    $sto->set_server_setting("fsck_stop_time", $sto->get_db_unixtime);
+    return $self->ok_line;
+}
+
+sub cmd_fsck_reset {
+    my MogileFS::Worker::Query $self = shift;
+    my $args = shift;
+
+    my $sto = Mgd::get_store();
+    $sto->set_server_setting("fsck_opt_policy_only", ($args->{policy_only} ? "1" : undef));
+
+    $self->_do_fsck_reset or return $self->err_line;
+    return $self->ok_line;
+}
+
+sub _do_fsck_reset {
+    my MogileFS::Worker::Query $self = shift;
+    my $sto = Mgd::get_store();
+    $sto->set_server_setting("fsck_highest_fid_checked", "0");
+    $sto->set_server_setting("fsck_start_time",       $sto->get_db_unixtime);
+    $sto->set_server_setting("fsck_stop_time",        undef);
+    $sto->set_server_setting("fsck_fids_checked",     0);
+    $sto->set_server_setting("fsck_fid_at_end",       $sto->max_fidid);
+}
+
+sub cmd_fsck_clearlog {
+    my MogileFS::Worker::Query $self = shift;
+    my $sto = Mgd::get_store();
+    $sto->clear_fsck_log;
+    return $self->ok_line;
+}
+
+sub cmd_fsck_getlog {
+    my MogileFS::Worker::Query $self = shift;
+    my $args = shift;
+
+    my $sto = Mgd::get_store();
+    my @rows = $sto->fsck_log_rows($args->{after_logid}, 100);
+    my $ret;
+    my $n = 0;
+    foreach my $row (@rows) {
+        $n++;
+        foreach my $k (keys %$row) {
+            $ret->{"row_${n}_$k"} = $row->{$k} if defined $row->{$k};
+        }
+    }
+    $ret->{row_count} = $n;
+    return $self->ok_line($ret);
+}
+
+sub cmd_fsck_status {
+    my MogileFS::Worker::Query $self = shift;
+
+    my $sto        = Mgd::get_store();
+    my $fsck_host  = MogileFS::Config->server_setting('fsck_host');
+    my $intss      = sub { MogileFS::Config->server_setting($_[0]) || 0 };
+    my $ret = {
+        running         => ($fsck_host ? 1 : 0),
+        host            => $fsck_host,
+        max_fid_checked => $intss->('fsck_highest_fid_checked'),
+        policy_only     => $intss->('fsck_opt_policy_only'),
+        end_fid         => $intss->('fsck_fid_at_end'),
+        start_time      => $intss->('fsck_start_time'),
+        stop_time       => $intss->('fsck_stop_time'),
+        current_time    => $sto->get_db_unixtime,
+        max_logid       => $sto->max_fsck_logid,
+    };
+
+    # throw some stats in.
+    my $ev_cts = $sto->fsck_evcode_counts(time_gte => $ret->{start_time});
+    while (my ($ev, $ct) = each %$ev_cts) {
+        $ret->{"num_$ev"} = $ct;
+    }
+
+    return $self->ok_line($ret);
 }
 
 sub ok_line {

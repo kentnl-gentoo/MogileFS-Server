@@ -7,7 +7,9 @@ use DBI;  # no reason a Store has to be DBI-based, but for now they all are.
 
 # this is incremented whenever the schema changes.  server will refuse
 # to start-up with an old schema version
-use constant SCHEMA_VERSION => 7;
+#
+# 8: adds fsck_log table
+use constant SCHEMA_VERSION => 8;
 
 sub new {
     my ($class) = @_;
@@ -352,7 +354,7 @@ sub setup_database {
                       domain class file tempfile file_to_delete
                       unreachable_fids file_on file_on_corrupt host
                       device server_settings file_to_replicate
-                      file_to_delete_later
+                      file_to_delete_later fsck_log
                       ), @extra_tables) {
         $sto->create_table($t);
     }
@@ -582,6 +584,18 @@ sub TABLE_file_to_delete_later {
 )"
 }
 
+sub TABLE_fsck_log {
+    "CREATE TABLE fsck_log (
+logid  INT UNSIGNED NOT NULL AUTO_INCREMENT,
+PRIMARY KEY (logid),
+utime  INT UNSIGNED NOT NULL,
+fid    INT UNSIGNED NULL,
+evcode CHAR(4),
+devid  MEDIUMINT UNSIGNED,
+INDEX(utime)
+)"
+}
+
 # these five only necessary for MySQL, since no other database existed
 # before, so they can just create the tables correctly to begin with.
 # in the future, there might be new alters that non-MySQL databases
@@ -796,6 +810,19 @@ sub fid_devids {
                                              undef, $fidid) || [] };
 }
 
+# return hashref of { $fidid => [ $devid, $devid... ] } for a bunch of given @fidids
+sub fid_devids_multiple {
+    my ($self, @fidids) = @_;
+    my $in = join(",", map { $_+0 } @fidids);
+    my $ret = {};
+    my $sth = $self->dbh->prepare("SELECT fid, devid FROM file_on WHERE fid IN ($in)");
+    $sth->execute;
+    while (my ($fidid, $devid) = $sth->fetchrow_array) {
+        push @{$ret->{$fidid} ||= []}, $devid;
+    }
+    return $ret;
+}
+
 # return hashref of columns classid, dmid, dkey, given a $fidid, or return undef
 sub tempfile_row_from_fid {
     my ($self, $fidid) = @_;
@@ -1002,17 +1029,25 @@ sub get_fidids_by_device {
     return $fidids;
 }
 
-# takes two arguments, fidid to be above, and optional limit (default 1,000).  returns up to that
-# that many fidids above the provided fidid.  returns array of (sorted) fid ids.
-sub get_fidids_above {
+# takes two arguments, fidid to be above, and optional limit (default
+# 1,000).  returns up to that that many fidids above the provided
+# fidid.  returns array of MogileFS::FID objects, sorted by fid ids.
+sub get_fids_above_id {
     my ($self, $fidid, $limit) = @_;
     $limit ||= 1000;
     $limit = int($limit);
 
+    my @ret;
     my $dbh = $self->dbh;
-    my $fidids = $dbh->selectcol_arrayref("SELECT fid FROM file WHERE fid > ? ORDER BY fid LIMIT $limit",
-                                          undef, $fidid);
-    return @$fidids;
+    my $sth = $dbh->prepare("SELECT fid, dmid, dkey, length, classid ".
+                            "FROM   file ".
+                            "WHERE  fid > ? ".
+                            "ORDER BY fid LIMIT $limit");
+    $sth->execute($fidid);
+    while (my $row = $sth->fetchrow_hashref) {
+        push @ret, MogileFS::FID->new_from_db_row($row);
+    }
+    return @ret;
 }
 
 # creates a new domain, given a domain namespace string.  return the dmid on success,
@@ -1180,10 +1215,83 @@ sub enqueue_fids_to_delete {
         or die "file_to_delete insert failed";
 }
 
+# clears everything from the fsck_log table
+# return 1 on success.  die otherwise.
+sub clear_fsck_log {
+    my $self = shift;
+    $self->dbh->do("DELETE FROM fsck_log");
+    return 1;
+}
+
+sub fsck_log {
+    my ($self, %opts) = @_;
+    $self->dbh->do("INSERT INTO fsck_log (utime, fid, evcode, devid) ".
+                   "VALUES (" . $self->unix_timestamp . ",?,?,?)",
+                   undef,
+                   delete $opts{fid},
+                   delete $opts{code},
+                   delete $opts{devid});
+    croak("Unknown opts") if %opts;
+    return 1;
+}
+
+sub get_db_unixtime {
+    my $self = shift;
+    return $self->dbh->selectrow_array("SELECT " . $self->unix_timestamp);
+}
+
+sub max_fidid {
+    my $self = shift;
+    return $self->dbh->selectrow_array("SELECT MAX(fid) FROM file");
+}
+
+sub max_fsck_logid {
+    my $self = shift;
+    return $self->dbh->selectrow_array("SELECT MAX(logid) FROM fsck_log");
+}
+
+# returns array of $row hashrefs, from fsck_log table
+sub fsck_log_rows {
+    my ($self, $after_logid, $limit) = @_;
+    $limit       = int($limit || 100);
+    $after_logid = int($after_logid || 0);
+
+    my @rows;
+    my $sth = $self->dbh->prepare(qq{
+        SELECT logid, utime, fid, evcode, devid
+        FROM fsck_log
+        WHERE logid > ?
+        ORDER BY logid
+        LIMIT $limit
+    });
+    $sth->execute($after_logid);
+    my $row;
+    push @rows, $row while $row = $sth->fetchrow_hashref;
+    return @rows;
+}
+
+sub fsck_evcode_counts {
+    my ($self, %opts) = @_;
+    my $gte = delete $opts{time_gte};
+    die if %opts;
+
+    my $ret = {};
+    my $sth = $self->dbh->prepare(qq{
+        SELECT evcode, COUNT(*) FROM fsck_log
+        WHERE utime >= ?
+        GROUP BY evcode
+    });
+    $sth->execute($gte||0);
+    while (my ($ev, $ct) = $sth->fetchrow_array) {
+        $ret->{$ev} = $ct;
+    }
+    return $ret;
+}
+
 # run before daemonizing.  you can die from here if you see something's amiss.  or emit
 # warnings.
-sub pre_daemonize_checks {
-}
+sub pre_daemonize_checks { }
+
 
 1;
 

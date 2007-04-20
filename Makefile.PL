@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 #   Perl Makefile for Danga-Socket
-#   $Id: Makefile.PL 787 2007-03-23 17:07:21Z bradfitz $
+#   $Id: Makefile.PL 833 2007-04-17 23:48:37Z bradfitz $
 #
 #   Invoke with 'perl Makefile.PL'
 #
@@ -19,7 +19,7 @@ WriteMakefile(
     NAME                    => 'mogilefs-server',
     VERSION_FROM            => 'lib/MogileFS/Server.pm',
     AUTHOR                  => 'Brad Fitzpatrick <brad@danga.com>',
-    ABSTRACT                => 'MogileFS server components',
+    ABSTRACT_FROM           => 'lib/MogileFS/Server.pm',
     EXE_FILES               => $exefiles,
     PREREQ_PM               => {
         'Danga::Socket'    => '1.56',

@@ -13,7 +13,17 @@ sub new {
         length   => undef,
         classid  => undef,
         _loaded  => 0,
+        _devids  => undef,   # undef, or pre-loaded arrayref devid list
     }, $class;
+}
+
+# mutates/blesses given row.
+sub new_from_db_row {
+    my ($class, $row) = @_;
+    # TODO: sanity check provided row more?
+    $row->{fidid}   = delete $row->{fid} or die "Missing 'fid' column";
+    $row->{_loaded} = 1;
+    return bless $row, $class;
 }
 
 # quick port of old API.  perhaps not ideal.
@@ -21,11 +31,21 @@ sub new_from_dmid_and_key {
     my ($class, $dmid, $key) = @_;
     my $row = Mgd::get_store()->read_store->file_row_from_dmid_key($dmid, $key)
         or return undef;
-    $row->{fidid}   = delete $row->{fid};
-    $row->{_loaded} = 1;
-    return bless $row, $class;
+    return $class->new_from_db_row($row);
 }
 
+# given a bunch of ::FID objects, populates their devids en-masse
+# (for the fsck worker, which doesn't want to do many database
+# round-trips)
+sub mass_load_devids {
+    my ($class, @fids) = @_;
+    my $sto = Mgd::get_store();
+    my $locs = $sto->fid_devids_multiple(map { $_->id } @fids);
+    my @ret;
+    foreach my $fid (@fids) {
+        $fid->{_devids} = $locs->{$fid->id} || [];
+    }
+}
 # --------------------------------------------------------------------------
 
 sub exists {
@@ -123,6 +143,12 @@ sub rename {
 # returns array of devids that this fid is on
 sub devids {
     my $self = shift;
+
+    # if it was mass-loaded and stored in _devids arrayref, use
+    # that instead of going to db...
+    return @{$self->{_devids}} if $self->{_devids};
+
+    # else get it from the database
     return Mgd::get_store()->read_store->fid_devids($self->id);
 }
 
@@ -130,6 +156,66 @@ sub devids {
 sub class {
     my $self = shift;
     return MogileFS::Class->of_fid($self);
+}
+
+# returns bool:  if fid's presumed-to-be-on devids meet the file class'
+# replication policy rules.
+sub devids_meet_policy {
+    my $self = shift;
+    my $cls  = $self->class;
+
+    my $policy_class = $cls->policy_class
+        or die "No policy class";
+
+    my $alldev = MogileFS::Device->map
+        or die "No global device map";
+
+    eval "use $policy_class; 1;";
+    die "Failed to load policy class: $policy_class: $@" if $@;
+
+    my $ddevid = $policy_class->replicate_to(
+                                             fid       => $self->id,
+                                             on_devs   => [ map { MogileFS::Device->of_devid($_) } $self->devids ],
+                                             all_devs  => $alldev,
+                                             failed    => {},
+                                             min       => $cls->mindevcount,
+                                             );
+
+    # it's good only if the plugin policy returns defined zero.  undef and >0 are bad.
+    return 1 if defined $ddevid && $ddevid == 0;
+    return 0;
+}
+
+sub fsck_log {
+    my ($self, $code, $dev) = @_;
+    Mgd::get_store()->fsck_log(
+                               code  => $code,
+                               fid   => $self->id,
+                               devid => ($dev ? $dev->id : undef),
+                               );
+
+}
+
+sub forget_cached_devids {
+    my $self = shift;
+    $self->{_devids} = undef;
+}
+
+# returns MogileFS::DevFID object, after noting in the db that this fid is on this DB.
+# it trusts you that it is, and that you've verified it.
+sub note_on_device {
+    my ($fid, $dev) = @_;
+    my $dfid = MogileFS::DevFID->new($dev, $fid);
+    $dfid->add_to_db;
+    $fid->forget_cached_devids;
+    return $dfid;
+}
+
+sub forget_about_device {
+    my ($fid, $dev) = @_;
+    $dev->forget_about($fid);
+    $fid->forget_cached_devids;
+    return 1;
 }
 
 1;

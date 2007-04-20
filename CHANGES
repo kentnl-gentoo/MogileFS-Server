@@ -1,3 +1,15 @@
+2007-04-20: Release version 2.09
+
+        * filesystem checker (Fsck worker).  off by default, unless
+          it's enabled via protocol.  Control/monitor it with mogadm
+          in MogileFS-Utils 2.08, which needs MogileFS::Client 1.06.
+
+        * replication speed-up on configurations with only 1 host.
+          (replication would randomly have no suggestions before, when
+           there was only 1 target host, so replication would be rescheduled
+           until the future, when random returned a different device on
+           that host)
+
 2007-04-17: Release version 2.08
 
         * (no runtime-visible changes from 2.07)

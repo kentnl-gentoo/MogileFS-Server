@@ -2,7 +2,18 @@ package MogileFS::Server;
 use strict;
 use warnings;
 use vars qw($VERSION);
-$VERSION = "2.08";
+$VERSION = "2.09";
+
+=head1 NAME
+
+MogileFS::Server - MogileFS (distributed filesystem) server
+
+=head1 SYNOPSIS
+
+ $s = MogileFS::Server->server;
+ $s->run;
+
+=cut
 
 use IO::Socket;
 use Symbol;
@@ -229,6 +240,9 @@ sub log {
     }
 }
 
-
-
 1;
+__END__
+#Just for MakeMaker's kinda lame regexp for ABSTRACT_FROM
+=dummypod
+mogilefs::server - MogileFS (distributed filesystem) server.
+
