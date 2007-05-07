@@ -6,11 +6,14 @@ use base 'MogileFS::Worker';
 use fields (
             'fidtodo',   # hashref { fid => 1 }
             'peerrepl',  # hashref { fid => time() } # when peer started replicating
+            'rebal_pol_obj',    # rebalancer policy object
             );
 
 use List::Util ();
 use MogileFS::Util qw(error every debug);
 use MogileFS::Class;
+use MogileFS::RebalancePolicy::DrainDevices;
+use MogileFS::ReplicationRequest qw(rr_upgrade);
 
 # setup the value used in a 'nexttry' field to indicate that this item will never
 # actually be tried again and require some sort of manual intervention.
@@ -104,25 +107,37 @@ sub work {
             $unreachable{$r->[0]} = 1;
         }
 
+        my $idle = 1;
+
         # this finds stuff to replicate based on its record in the needs_replication table
-        $self->replicate_using_torepl_table;
+        $idle = 0 if $self->replicate_using_torepl_table;
 
         # this finds stuff to replicate based on the devcounts.  (old style)
         if (MogileFS::Config->config("old_repl_compat")) {
-            $self->replicate_using_devcounts;
+            $idle = 0 if $self->replicate_using_devcounts;
         }
 
+        # if replicators are otherwise idle, use them to make the world
+        # better, rebalancing things (if enabled), and draining devices (if
+        # any are marked drain)
+        if ($idle) {
+            $self->rebalance_devices;
+            $self->drain_devices;
+        }
     });
 }
 
 use constant REPLFETCH_LIMIT => 1000;
+
+# return 1 if we did something (or tried to do something), return 0 if
+# there was nothing to be done.
 sub replicate_using_torepl_table {
     my $self = shift;
 
     # find some fids to replicate, prioritize based on when they should be tried
     my $sto = Mgd::get_store();
     my @to_repl = $sto->files_to_replicate(REPLFETCH_LIMIT)
-        or return;
+        or return 0;
 
     # get random list of hashref of things to do:
     @to_repl = List::Util::shuffle(@to_repl);
@@ -148,7 +163,7 @@ sub replicate_using_torepl_table {
             # $status is either 0 (failure, handled below), 1 (success, we actually
             # replicated this file), or 2 (success, but someone else replicated it).
 
-            # when $staus == 2, this delete is unnecessary normally
+            # when $staus eq "lost_race", this delete is unnecessary normally
             # (somebody else presumably already deleted it if they
             # also replicated it), but in the case of running with old
             # replicators from previous versions, -or- simply if the
@@ -215,7 +230,7 @@ sub replicate_using_torepl_table {
         $update_nexttry->( offset => int(($backoff[$todo->{failcount}] || 86400) * (rand(0.4) + 0.8)) );
         $unlock->() if $unlock;
     }
-
+    return 1;
 }
 
 sub replicate_using_devcounts {
@@ -227,12 +242,13 @@ sub replicate_using_devcounts {
     # the MogileFS::Store system to make it db portable.  so we just
     # skip here if not using MySQL.
     my $sto = Mgd::get_store();
-    return unless $sto->isa("MogileFS::Store::MySQL");
+    return 0 unless $sto->isa("MogileFS::Store::MySQL");
 
     # call this $mdbh to indiciate it's a MySQL dbh, and to help grepping
     # for old handles.  :)
     my $mdbh = $sto->dbh;
 
+    my $did_something = 0;
     MogileFS::Class->foreach(sub {
         my $mclass = shift;
         my ($dmid, $classid, $min, $policy_class) = map { $mclass->$_ } qw(domainid classid mindevcount policy_class);
@@ -273,6 +289,7 @@ sub replicate_using_devcounts {
             foreach my $fid (@randfids) {
                 # now replicate this fid
                 $attempted++;
+                $did_something = 1;
                 next unless $self->{fidtodo}{$fid};
                 next if $self->peer_is_replicating($fid);
 
@@ -291,7 +308,7 @@ sub replicate_using_devcounts {
                     # $status is either 0 (failure, handled below), 1 (success, we actually
                     # replicated this file), or 2 (success, but someone else replicated it).
                     # so if it's 2, we just want to go to the next fid.  this file is done.
-                    next if $status == 2;
+                    next if $status eq "lost_race";
 
                     # if it was no longer reachable, mark it reachable
                     if (delete $unreachable{$fid}) {
@@ -316,25 +333,164 @@ sub replicate_using_devcounts {
             }
         }
     });
+    return $did_something;
 }
 
-# replicates $fid if its devcount is less than $min.  (eh, not quite)
-#
-# $policy_class is optional (perl classname representing replication policy).  if present, used.  if not, looked up based on $fid.
+sub rebalance_devices {
+    my $self = shift;
+    my $sto = Mgd::get_store();
+    return 0 unless $sto->server_setting('enable_rebalance');
+    my $pol = $self->rebalance_policy_obj or return 0;
+    unless ($self->run_rebalance_policy_a_bit($pol)) {
+        error("disabling rebalancing due to lack of work");
+        MogileFS::Config->set_server_setting("enable_rebalance", 0);
+    }
+}
+
+sub drain_devices {
+    my $self = shift;
+    my $pol = MogileFS::RebalancePolicy::DrainDevices->instance;
+    my $rv = $self->run_rebalance_policy_a_bit($pol);
+    #error("[$$] drained = $rv\n") if $rv;
+}
+
+# returns number of files rebalanced.
+sub run_rebalance_policy_a_bit {
+    my ($self, $pol) = @_;
+    my $stop_at = time() + 5; # Run for up to 5 seconds, then return.
+    my $n = 0;
+    my %avoid_devids = map { $_->id => 1 } $pol->dest_devs_to_avoid;
+    while (my $dfid = $pol->devfid_to_rebalance) {
+        $self->rebalance_devfid($dfid, avoid_devids => \%avoid_devids);
+        $n++;
+        last if time() >= $stop_at;
+    }
+    return $n;
+}
+
+sub rebalance_policy_obj {
+    my $self = shift;
+    my $rclass = Mgd::get_store()->server_setting('rebalance_policy') ||
+        "MogileFS::RebalancePolicy::PercentFree";
+
+    # return old one, if it's still of the same type.
+    if ($self->{'rebal_pol_obj'} && ref($self->{'rebal_pol_obj'}) eq $rclass) {
+        return $self->{'rebal_pol_obj'};
+    }
+
+    return error("Bogus rebalance_policy setting") unless $rclass =~ /^[\w:\-]+$/;
+    return error("Failed to load $rclass: $@") unless eval "use $rclass; 1;";
+    my $pol = eval { $rclass->new };
+    return error("Failed to instantiate rebalance policy: $@") unless $pol;
+    return $self->{'rebal_pol_obj'} = $pol;
+}
+
+# Return 1 on success, 0 on failure.
+sub rebalance_devfid {
+    my ($self, $devfid, %opts) = @_;
+    MogileFS::Util::okay_args(\%opts, qw(avoid_devids));
+
+    my $fid = $devfid->fid;
+
+    # bail out early if this FID is no longer in the namespace (weird
+    # case where file is in file_on because not yet deleted, but
+    # has been replaced/deleted in 'file' table...).  not too harmful
+    # (just nosiy) if thise line didn't exist, but whatever... it
+    # makes stuff cleaner on my intentionally-corrupted-for-fsck-testing
+    # dev machine...
+    return 1 if ! $fid->exists;
+
+    my ($ret, $unlock) = replicate($fid,
+                                   mask_devids  => { $devfid->devid => 1 },
+                                   no_unlock    => 1,
+                                   avoid_devids => $opts{avoid_devids},
+                                   );
+
+    my $fail = sub {
+        my $error = shift;
+        $unlock->();
+        error("Rebalance for $devfid (" . $devfid->url . ") failed: $error");
+        return 0;
+    };
+
+    unless ($ret) {
+        return $fail->("Replication failed");
+    }
+
+    my $should_delete = 0;
+    my $del_reason;
+
+    if ($ret eq "lost_race") {
+        # for some reason, we did no work. that could be because
+        # either 1) we lost the race, as the error code implies,
+        # and some other process rebalanced this first, or 2)
+        # the file is over-replicated, and everybody just thinks they
+        # lost the race because the replication policy said there's
+        # nothing to do, even with this devfid masked away.
+        # so let's figure it out... if this devfid still exists,
+        # we're overreplicated, else we just lost the race.
+        if ($devfid->exists) {
+            # over-replicated
+
+            # see if some copy, besides this one we want
+            # to delete, is currently alive & of right size..
+            # just as extra paranoid check before we delete it
+            foreach my $test_df ($fid->devfids) {
+                next if $test_df->devid == $devfid->devid;
+                if ($test_df->size_matches) {
+                    $should_delete = 1;
+                    $del_reason = "over_replicated";
+                    last;
+                }
+            }
+        } else {
+            # lost race
+            $should_delete = 0;  # no-op
+        }
+    } else {
+        $should_delete = 1;
+        $del_reason = "did_rebalance;ret=$ret";
+    }
+
+    if ($should_delete) {
+        eval { $devfid->destroy };
+        if ($@) {
+            return $fail->("HTTP delete (due to '$del_reason') failed: $@");
+        }
+    }
+
+    $unlock->();
+    return 1;
+}
+
+# replicates $fid to make sure it meets its class' replicate policy.
 #
 # README: if you update this sub to return a new error code, please update the
 # appropriate callers to know how to deal with the errors returned.
+#
+# returns either:
+#    $rv
+#    ($rv, $unlock_sub)    -- when 'no_unlock' %opt is used. subref to release lock.
+# $rv is one of:
+#    0 = failure  (failure written to ${$opts{errref}})
+#    1 = success
+#    "lost_race" = skipping, we did no work and policy was already met.
+#    "nofid" => fid no longer exists. skip replication.
 sub replicate {
-    my ($fidid, %opts) = @_;
+    my ($fid, %opts) = @_;
+    $fid = MogileFS::FID->new($fid) unless ref $fid;
+    my $fidid = $fid->id;
+
     my $errref    = delete $opts{'errref'};
     my $no_unlock = delete $opts{'no_unlock'};
     my $sdevid    = delete $opts{'source_devid'};
-    die if %opts;
+    my $mask_devids  = delete $opts{'mask_devids'}  || {};
+    my $avoid_devids = delete $opts{'avoid_devids'} || {};
+    die "unknown_opts" if %opts;
+    die unless ref $mask_devids eq "HASH";
 
     # bool:  if source was explicitly requested by caller
     my $fixed_source = $sdevid ? 1 : 0;
-
-    my $fid    = MogileFS::FID->new($fidid);
 
     my $sto = Mgd::get_store();
     my $unlock = sub {
@@ -361,8 +517,10 @@ sub replicate {
             $ret = $rv ? $rv : error($errmsg);
         }
         if ($no_unlock) {
+            die "ERROR: must be called in list context w/ no_unlock" unless wantarray;
             return ($ret, $unlock);
         } else {
+            die "ERROR: must not be called in list context w/o no_unlock" if wantarray;
             $unlock->();
             return $ret;
         }
@@ -379,7 +537,7 @@ sub replicate {
 
     # if the fid doesn't even exist, consider our job done!  no point
     # replicating file contents of a file no longer in the namespace.
-    return $retunlock->(1) unless $fid->exists;
+    return $retunlock->("nofid") unless $fid->exists;
 
     my $cls = $fid->class;
     my $policy_class = $cls->policy_class;
@@ -389,18 +547,20 @@ sub replicate {
     }
 
     # learn what this devices file is already on
-    my @on_devs;       # all devices fid is on, reachable or not.
-    my @dead_devid;    # list of dead devids.  FIXME: do something with this?
-    my @on_up_devid;   # subset of @on_devs:  just devs that are alive or readonly
+    my @on_devs;         # all devices fid is on, reachable or not.
+    my @on_devs_tellpol; # subset of @on_devs, to tell the policy class about
+    my @on_up_devid;     # subset of @on_devs:  just devs that are readable
 
     foreach my $devid ($fid->devids) {
-        my $d = MogileFS::Device->of_devid($devid);
+        my $d = MogileFS::Device->of_devid($devid)
+            or next;
         push @on_devs, $d;
-        unless ($d && $d->status =~ /^alive|readonly$/) {
-            push @dead_devid, $devid;
-            next;
+        if ($d->dstate->should_have_files && ! $mask_devids->{$devid}) {
+            push @on_devs_tellpol, $d;
         }
-        push @on_up_devid, $devid;
+        if ($d->dstate->can_read_from) {
+            push @on_up_devid, $devid;
+        }
     }
 
     return $retunlock->(0, "no_source",   "Source is no longer available replicating $fidid") if @on_devs == 0;
@@ -411,22 +571,55 @@ sub replicate {
         return $retunlock->(0, "source_down", "Requested replication source device $sdevid not available");
     }
 
-    my $ddevid;
     my %dest_failed;    # devid -> 1 for each devid we were asked to copy to, but failed.
     my %source_failed;  # devid -> 1 for each devid we had problems reading from.
     my $got_copy_request = 0;  # true once replication policy asks us to move something somewhere
     my $copy_err;
 
-    while ($ddevid = $policy_class->replicate_to(
-                                                 fid       => $fidid,
-                                                 on_devs   => \@on_devs, # all device objects fid is on, dead or otherwise
-                                                 all_devs  => $devs,
-                                                 failed    => \%dest_failed,
-                                                 min       => $cls->mindevcount,
-                                                 ))
-    {
-        # they can return either a dev hashref/object or a devid number.  we want the number.
-        $ddevid = $ddevid->{devid} if ref $ddevid;
+    my $rr;  # MogileFS::ReplicationRequest
+    while (1) {
+        $rr = rr_upgrade($policy_class->replicate_to(
+                                                     fid       => $fidid,
+                                                     on_devs   => \@on_devs_tellpol, # all device objects fid is on, dead or otherwise
+                                                     all_devs  => $devs,
+                                                     failed    => \%dest_failed,
+                                                     min       => $cls->mindevcount,
+                                                     ));
+
+        last if $rr->is_happy;
+
+        my @ddevs;  # dest devs, in order of preferrence
+        my $ddevid; # dest devid we've chosen to copy to
+        if (@ddevs = $rr->copy_to_one_of_ideally) {
+            if (my @not_masked_ids = (grep { ! $mask_devids->{$_} &&
+                                             ! $avoid_devids->{$_}
+                                         }
+                                      map { $_->id } @ddevs)) {
+                $ddevid = $not_masked_ids[0];
+            } else {
+                # once we masked devids away, there were no
+                # ideal suggestions.  this is the case of rebalancing,
+                # which without this check could 'worsen' the state
+                # of the world.  consider the case:
+                #    h1[ d1 d2 ] h2[ d3 ]
+                # and files are on d1 & d3, an ideal layout.
+                # if d3 is being rebalanced, and masked away, the
+                # replication policy could presumably say to put
+                # the file on d2, even though d3 isn't dead.
+                # so instead, when masking is in effect, we don't
+                # use non-ideal placement, just bailing out.
+
+                # saying we lost a race is a bit of a lie.. but eh.
+                return $retunlock->("lost_race");
+            }
+        } elsif (@ddevs = $rr->copy_to_one_of_desperate) {
+            # TODO: reschedule a replication for 'n' minutes in future, or
+            # when new hosts/devices become available or change state
+            $ddevid = $ddevs[0]->id;
+        } else {
+            last;
+        }
+
         $got_copy_request = 1;
 
         # replication policy shouldn't tell us to put a file on a device
@@ -484,25 +677,16 @@ sub replicate {
         $dfid->add_to_db;
 
         push @on_devs, $devs->{$ddevid};
+        push @on_devs_tellpol, $devs->{$ddevid};
     }
 
-    # returning 0, not undef, means replication policy is happy and we're done.
-    if (defined $ddevid && ! $ddevid) {
+    if ($rr->is_happy) {
         return $retunlock->(1) if $got_copy_request;
-        return $retunlock->(2);  # some other process got to it first.  policy was happy immediately.
+        return $retunlock->("lost_race");  # some other process got to it first.  policy was happy immediately.
     }
 
-    # TODO: if we're on only 1 device and they returned undef, let's
-    # try and put it SOMEWHERE just to make ourselves happy, even if
-    # it it doesn't obey policy?  or is that decision itself policy?
-    # unfortunately, there's no way for the replication policy to say
-    # "replicate to 6, but I don't like that, so don't count it as good"
-
-    if ($got_copy_request) {
-        return $retunlock->(0, "copy_error", "errors copying fid $fidid during replication");
-    } else {
-        return $retunlock->(0, "policy_no_suggestions", "replication policy ran out of suggestions for us replicating fid $fidid");
-    }
+    return $retunlock->(0, "policy_no_suggestions",
+                        "replication policy ran out of suggestions for us replicating fid $fidid");
 }
 
 my $last_peerreplclean = 0;
@@ -593,6 +777,9 @@ sub http_copy {
         error("       http://$shostip:$sport$spath -> http://$dhostip:$dport$dpath");
         return 0;
     }
+
+    # need by webdav servers, like lighttpd...
+    $ddev->vivify_directories($d_dfid->url);
 
     # setup our pipe error handler, in case we get closed on
     my $pipe_closed = 0;

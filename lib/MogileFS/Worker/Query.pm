@@ -6,7 +6,8 @@ use warnings;
 
 use base 'MogileFS::Worker';
 use fields qw(querystarttime reqid);
-use MogileFS::Util qw(error error_code);
+use MogileFS::Util qw(error error_code first weighted_list
+                      device_state);
 
 sub new {
     my ($class, $psock) = @_;
@@ -236,22 +237,20 @@ sub cmd_create_open {
     $profstart->("wait_monitor");
     $self->wait_for_monitor;
 
-    # find a device to put this file on that has 100Mb free.
-    my (@dests, @hosts);
+    # find suitable device(s) to put this file on.
+    my @dests; # MogileFS::Device objects which are suitabke
 
     $profstart->("find_deviceid");
     while (scalar(@dests) < ($multi ? 3 : 1)) {
-        my $devid = MogileFS::Device->find_deviceid(
-                                                    random           => 1,
-                                                    must_be_writeable => 1,
-                                                    weight_by_free   => 1,
-                                                    not_on_hosts     => \@hosts,
-                                                    );
-        last unless defined $devid;
+        my $ddev = first {
+            $_->should_get_new_files &&
+            $_->not_on_hosts(map { $_->host } @dests)
+        } weighted_list map {
+            [$_, 100 * $_->percent_free]
+        } MogileFS::Device->devices;
 
-        my $ddev = MogileFS::Device->of_devid($devid);
-        push @dests, $devid;
-        push @hosts, $ddev->hostid;
+        last unless $ddev;
+        push @dests, $ddev;
     }
     return $self->err_line("no_devices") unless @dests;
 
@@ -272,9 +271,9 @@ sub cmd_create_open {
     }
 
     # make sure directories exist for client to be able to PUT into
-    foreach my $devid (@dests) {
-        $profstart->("vivify_dir_on_dev$devid");
-        my $dfid = MogileFS::DevFID->new($devid, $fidid);
+    foreach my $dev (@dests) {
+        $profstart->("vivify_dir_on_dev" . $dev->id);
+        my $dfid = MogileFS::DevFID->new($dev, $fidid);
         $dfid->vivify_directories;
     }
 
@@ -300,15 +299,15 @@ sub cmd_create_open {
     # add path info
     if ($multi) {
         my $ct = 0;
-        foreach my $devid (@dests) {
+        foreach my $dev (@dests) {
             $ct++;
-            $res->{"devid_$ct"} = $devid;
-            $res->{"path_$ct"} = MogileFS::DevFID->new($devid, $fidid)->url;
+            $res->{"devid_$ct"} = $dev->id;
+            $res->{"path_$ct"} = MogileFS::DevFID->new($dev, $fidid)->url;
         }
         $res->{dev_count} = $ct;
     } else {
-        $res->{devid} = $dests[0];
-        $res->{path}  = MogileFS::DevFID->new($res->{devid}, $fidid)->url;
+        $res->{devid} = $dests[0]->id;
+        $res->{path}  = MogileFS::DevFID->new($dests[0], $fidid)->url;
     }
 
     return $self->ok_line($res);
@@ -573,7 +572,8 @@ sub cmd_create_device {
     my $args = shift;
 
     my $status = $args->{state} || "alive";
-    return $self->err_line("invalid_state") unless $status =~ /^alive|down|readonly$/;
+    return $self->err_line("invalid_state") unless
+        device_state($status);
 
     my $devid = $args->{devid};
     return $self->err_line("invalid_devid") unless $devid && $devid =~ /^\d+$/;
@@ -725,7 +725,7 @@ sub cmd_create_host {
     }
 
     return $self->err_line('unknown_state')
-        unless $args->{status} =~ /^(?:alive|down|dead)$/;
+        unless MogileFS::Host->valid_initial_state($args->{status});
 
     # arguments all good, let's do it.
 
@@ -951,15 +951,17 @@ sub cmd_set_state {
 
     # figure out what they want to do
     my ($hostname, $devid, $state) = ($args->{host}, $args->{device}+0, $args->{state});
+
+    my $dstate = device_state($state);
     return $self->err_line('bad_params')
-        unless $hostname && $devid && ($state =~ /^(?:alive|down|dead|readonly)$/);
+        unless $hostname && $devid && $dstate;
 
     my $dev = MogileFS::Device->from_devid_and_hostname($devid, $hostname)
         or return $self->err_line('host_mismatch');
 
     # make sure the destination state isn't too high
     return $self->err_line('state_too_high')
-        if $dev->is_marked_dead && $state eq 'alive';
+        unless $dev->can_change_to_state($state);
 
     $dev->set_state($state);
     return $self->ok_line;
@@ -1117,8 +1119,17 @@ sub cmd_checker {
 sub cmd_set_server_setting {
     my MogileFS::Worker::Query $self = shift;
     my $args = shift;
-    return $self->err_line("bad_params") unless $args->{key};
-    MogileFS::Config->set_server_setting($args->{key}, $args->{value});
+    my $key = $args->{key} or
+        return $self->err_line("bad_params");
+    my $val = $args->{value};
+
+    my $chk  = MogileFS::Config->server_setting_is_writable($key) or
+        return $self->err_line("not_writable");
+
+    my $cleanval = eval { $chk->($val); };
+    return $self->err_line("invalid_format") if $@;
+
+    MogileFS::Config->set_server_setting($key, $cleanval);
     return $self->ok_line;
 }
 
@@ -1129,6 +1140,20 @@ sub cmd_server_setting {
     return $self->err_line("bad_params") unless $key;
     my $value = MogileFS::Config->server_setting($key);
     return $self->ok_line({key => $key, value => $value});
+}
+
+sub cmd_server_settings {
+    my MogileFS::Worker::Query $self = shift;
+    my $ss = Mgd::get_store()->server_settings;
+    my $ret = {};
+    my $n = 0;
+    while (my ($k, $v) = each %$ss) {
+        next unless MogileFS::Config->server_setting_is_readable($k);
+        $ret->{"key_count"} = ++$n;
+        $ret->{"key_$n"}    = $k;
+        $ret->{"value_$n"}  = $v;
+    }
+    return $self->ok_line($ret);
 }
 
 sub cmd_do_monitor_round {

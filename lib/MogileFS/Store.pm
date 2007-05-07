@@ -4,12 +4,14 @@ use warnings;
 use Carp qw(croak);
 use MogileFS::Util qw(throw max);
 use DBI;  # no reason a Store has to be DBI-based, but for now they all are.
+use List::Util ();
 
 # this is incremented whenever the schema changes.  server will refuse
 # to start-up with an old schema version
 #
 # 8: adds fsck_log table
-use constant SCHEMA_VERSION => 8;
+# 9: adds 'drain' state to enum in device table
+use constant SCHEMA_VERSION => 9;
 
 sub new {
     my ($class) = @_;
@@ -365,6 +367,7 @@ sub setup_database {
     $sto->upgrade_add_device_asof;
     $sto->upgrade_add_device_weight;
     $sto->upgrade_add_device_readonly;
+    $sto->upgrade_add_device_drain;
 
     return 1;
 }
@@ -606,6 +609,7 @@ sub upgrade_add_host_altip { 1 }
 sub upgrade_add_device_asof { 1 }
 sub upgrade_add_device_weight { 1 }
 sub upgrade_add_device_readonly { 1 }
+sub upgrade_add_device_drain { die "Not implemented in $_[0]" }
 
 # return true if deleted, 0 if didn't exist, exception if error
 sub delete_host {
@@ -1146,8 +1150,15 @@ sub should_begin_replicating_fidid {
     1;
 }
 
-# called when replicator is done replicating a fid, so you can cleanup whatever
-# you did in 'should_begin_replicating_fidid' above.
+# called when replicator is done replicating a fid, so you can cleanup
+# whatever you did in 'should_begin_replicating_fidid' above.
+#
+# NOTE: there's a theoretical race condition in the rebalance code,
+# where (without locking as provided by
+# should_begin_replicating_fidid/note_done_replicating), all copies of
+# a file can be deleted by independent replicators doing rebalancing
+# in different ways.  so you'll probably want to implement some
+# locking in this pair of functions.
 sub note_done_replicating {
     my ($self, $fidid) = @_;
 }
@@ -1351,6 +1362,41 @@ sub fsck_evcode_counts {
 # run before daemonizing.  you can die from here if you see something's amiss.  or emit
 # warnings.
 sub pre_daemonize_checks { }
+
+
+# attempt to grab a lock of lockname, and timeout after timeout seconds.
+# returns 1 on success and 0 on timeout.  dies if more than one lock is already outstanding.
+sub get_lock {
+    my ($self, $lockname, $timeout) = @_;
+    die "Lock recursion detected (grabbing $lockname, had $self->{last_lock}).  Bailing out." if $self->{lock_depth};
+    die "get_lock not implemented for $self";
+}
+
+# attempt to release a lock of lockname.
+# returns 1 on success and 0 if no lock we have has that name.
+sub release_lock {
+    my ($self, $lockname) = @_;
+    die "release_lock not implemented for $self";
+}
+
+# returns up to $limit @fidids which are on provided $devid
+sub random_fids_on_device {
+    my ($self, $devid, $limit) = @_;
+    $limit = int($limit) || 100;
+
+    my $dbh = $self->dbh;
+
+    # FIXME: this blows. not random.  and good chances these will
+    # eventually get to point where they're un-rebalanacable, and we
+    # never move on past the first 5000
+    my @some_fids = List::Util::shuffle(@{
+        $dbh->selectcol_arrayref("SELECT fid FROM file_on WHERE devid=? LIMIT 5000",
+                                 undef, $devid) || []
+                                 });
+
+    @some_fids = @some_fids[0..$limit-1] if $limit < @some_fids;
+    return @some_fids;
+}
 
 
 1;

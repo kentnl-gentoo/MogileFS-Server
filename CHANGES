@@ -1,3 +1,86 @@
+2007-05-07: Release version 2.15 ("fsck/drain/rebalance")
+
+        * minor bug fixes and enhancements for MultipleHosts replication
+          policy.  bunch of corner cases now checked with new tests.
+          now easy to write more replication policy tests in future.
+
+        * replication policies can now return "desperate" requests,
+          signalling that a replication reassessment should be
+          enqueued for the future, to see if things could be improved.
+          (that part's not currently implemented, but the real feature
+           and motivation is that the rebalancer now won't delete a
+           DevFID if it results in a desperate move, only an ideal move. )
+
+        * replication policies now can optionally return a new return
+          value of the (new) type MogileFS::ReplicationRequest, which
+          has pretty accessor names, can suggest multiple places,
+          can indicate non-ideal emergency replication decisions.
+          old plugins' return values will be transparently upgraded
+          to the equivalent new return value objects.
+
+        * adding new device state: "drain".  it's a hybrid of "dead"
+          (in that files are migrated off it) and "readonly", it that
+          it still serves traffic... it just doesn't get new files.
+          this also introduces the new object-oriented DeviceState class,
+          and device_state($name) utility function to get the DeviceState
+          singleton by name
+
+        * internal code cleanup.  notably, kill the old & nasty legacy
+          'find_deviceid' function which was ridiculously long and hairy.
+          the two callers are now more readable with sorts/greps/etc.
+
+        * make mogstored's devN/usage writing process (DiskUsage) be less
+          racy with the mogilefsd monitoring code... don't open file for
+          write... open read/write, then in one write system call, write
+          the entire file, with newline padding at end to cover old data,
+          then truncate it if necessary.  should remove harmless (but scary)
+          error messages previously reported by the mogilefsd monitor
+          about zero-length usage files.
+
+        * new protocol commands to list/set (certain) server settings,
+          with value sanity checking (see MogileFS::Config for which
+          are settable, and with what values).  needed for "enable_rebalance".
+          was partially enabled before for slave settings.  also needed
+          for memcached support before, which was never possible to
+          set with mogadm, only with db tweaking.
+
+        * make mogilefsd fsck use new mogstored fid_sizes command, to
+          do bulk stats.  speeds up fscks a ton.
+
+        * be robust against system clocks that go backwards between
+          gettimeofday calls:
+          http://lists.danga.com/pipermail/mogilefs/2007-April/000897.html
+
+        * Put gearman server in mogstored process, add worker
+          'mogstored-fidsizes' which runs as subprocess of mogstored. Add
+          side-channel command 'fid_sizes' which allows us to quickly enumerate
+          and get sizes for files across entire devices on a storage node.
+
+        * remove all code like $state eq "readonly", $state=~ /^dead|down$/
+          and instead convert it into specific questions on policy/traits
+          of given state, like $dev->should_put_new_files_on, or
+          $dev->should_drain_files_off.  see MogileFS::DeviceState,
+          objects of which are accessed via $dev->dstate, or new
+          MogileFS::Util device_state($name) wrapper.
+
+        * start of rebalance support.  (where replication workers, in their
+          idle time, can rearrange files to even out disk space and/or IO
+          activity on storage nodes... policy isn't hard-coded, and is
+          in fact currently random)
+
+        * lighttpd support in both mogilefsd and mogstored.  passes test
+          suite with environment MOGSTORED_SERVER_TYPE=lighttpd set now.
+
+        * abstract out the HTTP server support in mogstored, so
+          mogstored isn't just a perlbal wrapper, but an anything
+          wrapper. (in particular, lighttpd and apache)  mogstored still
+          exists for all its other misc admin/monitoring functions,
+          but can then manage/configure apache/lighttpd child process(es).
+          so far they're just stubbed out.
+
+        * split mogstored into separate files per class, rather than one
+          large script.
+
 2007-04-24: Release version 2.10
 
         * bug from earlier refactoring:  changing some 'next' to 'return'

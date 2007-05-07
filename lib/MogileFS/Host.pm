@@ -3,6 +3,7 @@ use strict;
 use warnings;
 use Net::Netmask;
 use Carp qw(croak);
+use MogileFS::Connection::Mogstored;
 
 my %singleton;        # hostid -> instance
 my $last_load = 0;    # unixtime of last 'reload_hosts'
@@ -13,6 +14,10 @@ sub create {
     my ($pkg, $hostname, $ip) = @_;
     my $hid = Mgd::get_store()->create_host($hostname, $ip);
     return MogileFS::Host->of_hostid($hid);
+}
+
+sub t_wipe_singletons {
+    %singleton = ();
 }
 
 sub of_hostid {
@@ -98,7 +103,8 @@ sub hosts {
 
 # --------------------------------------------------------------------------
 
-sub id { $_[0]{hostid} }
+sub id     { $_[0]{hostid} }
+sub hostid { $_[0]{hostid} }
 
 sub absorb_dbrow {
     my ($host, $hashref) = @_;
@@ -136,6 +142,18 @@ sub set_http_port     { shift->_set_field("http_port",     @_); }
 sub set_http_get_port { shift->_set_field("http_get_port", @_); }
 sub set_alt_ip        { shift->_set_field("altip",         @_); }
 sub set_alt_mask      { shift->_set_field("altmask",       @_); }
+
+# for test suite.  set fields in memory, without a MogileFS::Store
+sub t_init {
+    my $self = shift;
+    my $status = shift;
+    # TODO: once we have a MogileFS::HostState, update this to
+    # validate it.  not so important for now, though, since
+    # typos in tests will just make tests fail.
+    $self->{status}  = $status;
+    $self->{_loaded} = 1;
+    $self->{observed_state} = "reachable";
+}
 
 sub _set_field {
     my ($self, $field, $val) = @_;
@@ -191,6 +209,11 @@ sub hostname {
     return $host->{hostname};
 }
 
+sub should_get_new_files {
+    my $host = shift;
+    return $host->status eq "alive";
+}
+
 sub is_marked_down {
     my $host = shift;
     die "FIXME";
@@ -218,6 +241,35 @@ sub delete {
     my $rv = Mgd::get_store()->delete_host($host->id);
     MogileFS::Host->invalidate_cache;
     return $rv;
+}
+
+# returns/creates a MogileFS::Connection::Mogstored object to the
+# host's mogstored management/side-channel port (which starts
+# unconnected, and only connects when you ask it to, with its sock
+# method)
+sub mogstored_conn {
+    my $self = shift;
+    return $self->{mogstored_conn} ||=
+      MogileFS::Connection::Mogstored->new($self->ip, $self->sidechannel_port);
+}
+
+sub sidechannel_port {
+    # TODO: let this be configurable per-host?  currently it's configured
+    # once for all machines.
+    MogileFS->config("mogstored_stream_port");
+}
+
+# class method
+sub valid_state {
+    my ($class, $state) = @_;
+    return $state && $state =~ /^alive|dead|down$/;
+}
+
+# class method.  valid host state, for newly created hosts?
+# currently equal to valid_state.
+sub valid_initial_state {
+    my ($class, $state) = @_;
+    return $class->valid_state($state);
 }
 
 # --------------------------------------------------------------------------

@@ -1,10 +1,9 @@
 package MogileFS::ReplicationPolicy::MultipleHosts;
 use strict;
+use base 'MogileFS::ReplicationPolicy';
+use MogileFS::Util qw(weighted_list);
+use MogileFS::ReplicationRequest qw(ALL_GOOD TOO_GOOD TEMP_NO_ANSWER);
 
-# returns:
-#   0:      replication sufficient
-#   undef:  no suitable recommendations currently.
-#   >0:     devid to replicate to.
 sub replicate_to {
     my ($class, %args) = @_;
 
@@ -20,19 +19,17 @@ sub replicate_to {
     # number of devices we currently live on
     my $already_on = @$on_devs;
 
-    # total disks available (not marked dead)
-    my $total_disks = scalar grep { ! $_->is_marked_dead } values %$all_devs;
+    # a silly special case, bail out early.
+    return ALL_GOOD if $min == 1 && $already_on;
+
+    # total disks available which are candidates for having files on them
+    my $total_disks = scalar grep { $_->dstate->should_have_files } values %$all_devs;
 
     # if we have two copies and that's all the disks there are
     # anywhere, be happy enough, even if mindevcount is higher.  in
     # that case, when they add more disks later, they'll need to fsck
     # to make files replicate more.
-    return 0 if $already_on >= 2 && $already_on == $total_disks;
-
-    # FIXME: this is NOT true.  make sure it's on 2+ hosts at least, if min > 1.
-
-    # replication good.
-    return 0 if $already_on >= $min;
+    return ALL_GOOD if $already_on >= 2 && $already_on == $total_disks;
 
     # see which and how many unique hosts we're already on.
     my %on_dev;
@@ -44,24 +41,34 @@ sub replicate_to {
     my $uniq_hosts_on    = scalar keys %on_host;
     my $total_uniq_hosts = unique_hosts($all_devs);
 
-    # if there are more hosts we're not on yet, we want to exclude those from
-    # our applicable host search.
-    my $not_on_hosts = [];
+    return TOO_GOOD if $uniq_hosts_on >  $min;
+    return TOO_GOOD if $uniq_hosts_on == $min && $already_on > $min;
+    return ALL_GOOD if $uniq_hosts_on == $min;
+    return ALL_GOOD if $uniq_hosts_on >= $total_uniq_hosts && $already_on >= $min;
+
+    # if there are more hosts we're not on yet, we want to exclude devices we're already
+    # on from our applicable host search.
+    my %skip_host; # hostid => 1
     if ($uniq_hosts_on < $total_uniq_hosts) {
-        $not_on_hosts = [ keys %on_host ];
+        %skip_host = %on_host;
     }
 
-    my $good_devid =
-        MogileFS::Device->find_deviceid(
-                                        weight_by_free => 1, # NOTE: misleading name,
-                                                             # forces only return value!
-                                        random         => 1,
-                                        not_on_hosts   => $not_on_hosts,
-                                        not_devs       => { %on_dev, %$failed },
-                                        );
+    my @all_dests = weighted_list map {
+        [$_, 100 * $_->percent_free]
+     } grep {
+         ! $on_dev{$_->devid} &&
+         ! $failed->{$_->devid} &&
+         $_->should_get_replicated_files
+     } MogileFS::Device->devices;
 
-    return undef unless $good_devid;
-    return $good_devid;
+    return TEMP_NO_ANSWER unless @all_dests;
+
+    my @ideal = grep { ! $skip_host{$_->hostid} } @all_dests;
+    my @desp  = grep {   $skip_host{$_->hostid} } @all_dests;
+    return MogileFS::ReplicationRequest->new(
+                                             ideal => \@ideal,
+                                             desperate => \@desp,
+                                             );
 }
 
 sub unique_hosts {
@@ -69,7 +76,7 @@ sub unique_hosts {
     my %host;  # hostid -> 1
     foreach my $devid (keys %$devs) {
         my $dev = $devs->{$devid};
-        next unless $dev->status =~ /^alive|readonly$/;
+        next unless $dev->dstate->should_get_repl_files;
         $host{$dev->hostid}++;
     }
     return scalar keys %host;

@@ -3,6 +3,7 @@ use strict;
 use warnings;
 use Carp qw(croak);
 use MogileFS::Config qw(DEVICE_SUMMARY_CACHE_TIMEOUT);
+use MogileFS::Util qw(okay_args device_state error);
 
 BEGIN {
     my $testing = $ENV{TESTING} ? 1 : 0;
@@ -17,6 +18,7 @@ my $all_loaded = 0; # bool: have we loaded all the devices?
 # %args include devid, hostid, and status (in (alive, down, readonly))
 sub create {
     my ($pkg, %args) = @_;
+    okay_args(\%args, qw(devid hostid status));
     my $devid = Mgd::get_store()->create_device(@args{qw(devid hostid status)});
     MogileFS::Device->invalidate_cache;
     return $pkg->of_devid($devid);
@@ -30,6 +32,27 @@ sub of_devid {
         no_mkcol => 0,
         _loaded  => 0,
     }, $class;
+}
+
+sub t_wipe_singletons {
+    %singleton = ();
+    $last_load = time();  # fake it
+}
+
+sub t_init {
+    my ($self, $hostid, $state) = @_;
+    $self->{_loaded} = 1;
+
+    my $dstate = device_state($state) or
+        die "Bogus state";
+
+    $self->{hostid}  = $hostid;
+    $self->{status}  = $state;
+    $self->{observed_state} = "writeable";
+
+    # say it's 10% full, of 1GB
+    $self->{mb_total} = 1000;
+    $self->{mb_used}  = 100;
 }
 
 sub from_devid_and_hostname {
@@ -66,97 +89,6 @@ sub vivify_directories {
     $dev->create_directory("/dev$devid/$p1/$p2/$p3");
 }
 
-# general purpose device locator.  example:
-#
-# my $devid = MogileFS::Device->find_deviceid(
-#     random => 1,              # get random device (else find first suitable)
-#     min_free_space => 100,    # with at least 100MB free
-#     weight_by_free => 1,      # find result weighted by free space
-#     max_disk_age => 5,        # minutes of age the last usage report can be before we ignore the disk
-#     not_on_hosts => [ 1, 2 ], # no devices on hosts 1 and 2
-#     must_be_alive => 1,       # if specified, device/host must be writeable (fully available)
-#     not_devs => { $devid => 1 }  # devids to not return.
-# );
-#
-# returns undef if no suitable device was found.  else, if you wanted an
-# array will return an array of the suitable devices--if you want just a
-# single item, you get just the first one found.
-sub find_deviceid {
-    my $class = shift;
-    my %opts = ( @_ );
-
-    # validate we're getting called with known parameters
-    my %valid_keys = map { $_ => 1 } qw( random min_free_space weight_by_free max_disk_age
-                                         not_on_hosts must_be_writeable must_be_readable
-                                         not_devs
-                                         );
-    warn "invalid key $_ in call to find_deviceid\n"
-        foreach grep { ! $valid_keys{$_} } keys %opts;
-
-    # copy down global minimum free space if not specified
-    $opts{min_free_space} ||= MogileFS->config("min_free_space");
-    $opts{max_disk_age}   ||= MogileFS->config("max_disk_age");
-    if ($opts{max_disk_age}) {
-        # FIXME: don't use local machine's time() for this.  time sync
-        # issues!  instead, the monitor process should track this,
-        # noting the difference in relative time between the server's
-        # time (in Date: response header) and time in the usage.txt
-        # file.
-        $opts{max_disk_age} = time() - ($opts{max_disk_age} * 60);
-    }
-    $opts{must_be_alive} = 1 unless defined $opts{must_be_alive};
-    $opts{not_devs}    ||= {};
-
-    # setup for iterating over devices
-    my $devs = MogileFS::Device->map;
-    my @devids = grep { ! $opts{not_devs}{$_} } keys %$devs;
-    my $devcount = scalar(@devids);
-    my $start = $opts{random} ? int(rand($devcount)) : 0;
-    my %not_on_host = ( map { $_ => 1 } @{$opts{not_on_hosts} || []} );
-    my $total_free = 0;
-
-    # now find a device that matches what they want
-    my @list;
-    for (my $i = 0; $i < $devcount; $i++) {
-        my $idx = ($i + $start) % $devcount;
-        my $dev = $devs->{$devids[$idx]};
-        my $host = $dev->host or next;
-
-        # series of suitability checks
-        next unless $dev->is_marked_alive;
-        next if $not_on_host{$dev->{hostid}};
-        next if $opts{max_disk_age} && $dev->{mb_asof} &&
-            $dev->{mb_asof} < $opts{max_disk_age};
-        next if $opts{min_free_space} && $dev->{mb_total} &&
-                $dev->{mb_free} < $opts{min_free_space};
-
-        if ($opts{must_be_writeable}) {
-            next unless $host->observed_reachable;
-            next unless $dev->observed_writeable;
-        } elsif ($opts{must_be_readable}) {
-            next unless $host->observed_reachable;
-            next unless $dev->observed_readable;
-        }
-
-        # we get here, this is a suitable device
-        push @list, $dev->{devid};
-        $total_free += $dev->{mb_free};
-    }
-
-    # now we have a list ordered randomly, do free space weighting
-    if ($opts{weight_by_free}) {
-        my $rand = int(rand($total_free));
-        my $cur = 0;
-        foreach my $devid (@list) {
-            $cur += $devs->{$devid}->{mb_free};
-            return $devid if $cur >= $rand;
-        }
-    }
-
-    # return whole list if wanting array, else just first item
-    return wantarray ? @list : shift(@list);
-}
-
 # returns array of all MogileFS::Device objects
 sub devices {
     my $class = shift;
@@ -165,6 +97,7 @@ sub devices {
 }
 
 # returns hashref of devid -> $device_obj
+# you're allowed to mess with this returned hashref
 sub map {
     my $class = shift;
     my $ret = {};
@@ -234,10 +167,6 @@ sub absorb_dbrow {
 
     $dev->{$_} ||= 0 foreach qw(mb_total mb_used mb_asof);
 
-    # makes others have an easier time of finding devices by free space
-    # FIXME: this should just be an accessor nowadays, not pre-calced
-    $dev->{mb_free} = $dev->{mb_total} - $dev->{mb_used};
-
     my $host = MogileFS::Host->of_hostid($dev->{hostid});
     if ($host && $host->exists) {
         my $host_status = $host->status;
@@ -257,6 +186,22 @@ sub absorb_dbrow {
     }
 
     $dev->{_loaded} = 1;
+}
+
+# returns 0 if not known, else [0,1]
+sub percent_free {
+    my $dev = shift;
+    $dev->_load;
+    return 0 unless $dev->{mb_total} && defined $dev->{mb_used};
+    return 1 - ($dev->{mb_used} / $dev->{mb_total});
+}
+
+# returns undef if not known, else [0,1]
+sub percent_full {
+    my $dev = shift;
+    $dev->_load;
+    return undef unless $dev->{mb_total} && defined $dev->{mb_used};
+    return $dev->{mb_used} / $dev->{mb_total};
 }
 
 our $util_no_broadcast = 0;
@@ -309,6 +254,8 @@ sub observed_unreachable {
     return $dev->{observed_state} && $dev->{observed_state} eq "unreachable";
 }
 
+# returns status as a string (SEE ALSO: dstate, returns DeviceState object,
+# which knows the traits/capabilities of that named state)
 sub status {
     my $dev = shift;
     $dev->_load;
@@ -317,30 +264,59 @@ sub status {
 
 sub weight {
     my $dev = shift;
-
     $dev->_load;
-
     return $dev->{weight};
 }
 
-sub is_marked_alive {
-    my $self = shift;
-    return $self->status eq "alive";
+sub dstate {
+    my $ds = device_state($_[0]->status);
+    return $ds if $ds;
+    error("dev$_[0]->{devid} has bogus status '$_[0]->{status}', pretending 'down'");
+    return device_state("down");
 }
 
-sub is_marked_dead {
+sub can_delete_from {
     my $self = shift;
-    return $self->status eq "dead";
+    return $self->dstate->can_delete_from;
 }
 
-sub is_marked_down {
+sub can_read_from {
     my $self = shift;
-    return $self->status eq "down";
+    return $self->dstate->can_read_from;
 }
 
-sub is_marked_readonly {
+sub should_get_new_files {
+    my $dev    = shift;
+    my $dstate = $dev->dstate;
+
+    return 0 unless $dstate->should_get_new_files;
+    return 0 unless $dev->observed_writeable;
+    return 0 unless $dev->host->should_get_new_files;
+
+    # have enough disk space? (default: 100MB)
+    my $min_free = MogileFS->config("min_free_space");
+    return 0 if $dev->{mb_total} &&
+        $dev->mb_free < $min_free;
+
+    return 1;
+}
+
+sub mb_free {
     my $self = shift;
-    return $self->status eq "readonly";
+    return $self->{mb_total} - $self->{mb_used};
+}
+
+# currently the same policy, but leaving it open for differences later.
+sub should_get_replicated_files {
+    my $dev = shift;
+    return $dev->should_get_new_files;
+}
+
+sub not_on_hosts {
+    my ($dev, @hosts) = @_;
+    my @hostids   = map { ref($_) ? $_->hostid : $_ } @hosts;
+    my $my_hostid = $dev->hostid;
+    return (grep { $my_hostid == $_ } @hostids) ? 0 : 1;
 }
 
 sub exists {
@@ -410,14 +386,7 @@ sub create_directory {
             delete $dir_made{$k} if $dir_made{$k} < $now - 3600;
         }
     }
-}
-
-# returns array of MogileFS::Device objects which are in state 'dead'.
-sub dead_devices {
-    my $class = shift;
-    return
-        grep { $_->status eq "dead" }
-        MogileFS::Device->devices;
+    return 1;
 }
 
 sub fid_list {
@@ -453,9 +422,10 @@ sub overview_hashref {
 
     my $ret = {};
     foreach my $k (qw(devid hostid status weight observed_state
-                      mb_total mb_used mb_asof mb_free utilization)) {
+                      mb_total mb_used mb_asof utilization)) {
         $ret->{$k} = $dev->{$k};
     }
+    $ret->{mb_free} = $dev->mb_free;
     return $ret;
 }
 
@@ -468,14 +438,25 @@ sub set_weight {
 
 sub set_state {
     my ($dev, $state) = @_;
-    die "Bogus state" unless $state =~ /^(?:alive|down|dead|readonly)$/;
+    my $dstate = device_state($state) or
+        die "Bogus state";
     my $sto = Mgd::get_store();
     $sto->set_device_state($dev->id, $state);
     MogileFS::Device->invalidate_cache;
 
     # wake a reaper process up from sleep to get started as soon as possible
     # on re-replication
-    MogileFS::ProcManager->wake_a("reaper") if $state eq "dead";
+    MogileFS::ProcManager->wake_a("reaper") if $dstate->should_wake_reaper;
+}
+
+# given the current state, can this device transition into the provided $newstate?
+sub can_change_to_state {
+    my ($self, $newstate) = @_;
+    # don't allow dead -> alive transitions.  (yes, still possible
+    # to go dead -> readonly -> alive to bypass this, but this is
+    # all more of a user-education thing than an absolute policy)
+    return 0 if $self->dstate->is_perm_dead && $newstate eq 'alive';
+    return 1;
 }
 
 # --------------------------------------------------------------------------
