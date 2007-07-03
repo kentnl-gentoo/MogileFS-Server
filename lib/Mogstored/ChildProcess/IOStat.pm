@@ -21,7 +21,6 @@ sub pre_exec_init {
     $ENV{MOG_DOCROOT} = Perlbal->service('mogstored')->{docroot};
 }
 
-my $docroot;
 sub run {
     $docroot = $ENV{MOG_DOCROOT};
     die "\$ENV{MOG_DOCROOT} not set"                unless $docroot;
@@ -37,12 +36,23 @@ sub run {
         exit(0);
     };
 
+    my $check_for_parent = sub {
+        # shut ourselves down if our parent mogstored
+        # has gone away.
+        my $ppid = getppid();
+        unless ($ppid && kill(0,$ppid)) {
+            kill 9, $iostat_pid if $iostat_pid;
+            exit(0);
+        }
+    };
+
     my $get_iostat_fh = sub {
         while (1) {
             if ($iostat_pid = open (my $fh, "iostat -dx 1 30|")) {
                 return $fh;
             }
             # TODO: try and find other paths to iostat
+            $check_for_parent->();
             warn "Failed to open iostat: $!\n"; # this will just go to /dev/null, but will be straceable
             sleep 10;
         }
@@ -82,14 +92,7 @@ sub run {
                 $ret .= ".\n";
                 print $ret;
 
-                # shut ourselves down if our parent mogstored
-                # has gone away.
-                my $ppid = getppid();
-                unless ($ppid && kill(0,$ppid)) {
-                    kill 9, $iostat_pid if $iostat_pid;
-                    exit(0);
-                }
-
+                $check_for_parent->();
                 next;
             }
         }
@@ -140,7 +143,7 @@ sub mog_sysid_map {
             my $devname = $number_to_name{$original} or next;
 
             # Pull off the new device name with a regex
-            if (my ($newname) = $devname =~ m/^([hs]d\w)\d+$/) {
+            if (my ($newname) = $devname =~ m/^([hs]d\w+)\d+$/) {
                 # Skip if we can't map it back to a device number
                 my $newnum = $name_to_number{$newname} or next;
                 $map->{$mogdevid} = $newnum;

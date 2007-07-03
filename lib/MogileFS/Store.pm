@@ -42,6 +42,8 @@ sub new_from_dsn_user_pass {
         raise_errors => $subclass->want_raise_errors,
         slave_list_cachetime => 0,
         slave_list_cache     => [],
+        recheck_req_gen  => 0,  # incremented generation, of recheck of dbh being requested
+        recheck_done_gen => 0,  # once recheck is done, copy of what the request generation was
     }, $subclass;
     $self->init;
     return $self;
@@ -72,7 +74,8 @@ sub new_from_mogdbsetup {
 
     # otherwise, we need to make the requested database, setup permissions, etc
     $class->status("couldn't connect to database as mogilefs user.  trying root...");
-    my $rdbh = DBI->connect($class->dsn_of_root, $args{dbrootuser}, $args{dbrootpass}, {
+    my $rootdsn = $class->dsn_of_root($args{dbname}, $args{dbhost});
+    my $rdbh = DBI->connect($rootdsn, $args{dbrootuser}, $args{dbrootpass}, {
         PrintError => 0,
     }) or
         die "Failed to connect to $dsn as specified root user: " . DBI->errstr . "\n";
@@ -213,8 +216,10 @@ sub read_store {
     return $self unless $self->can_do_slaves;
 
     if ($self->{slave_ok}) {
-        my $slave = $self->get_slave;
-        return $slave if $slave;
+        if (my $slave = $self->get_slave) {
+            $slave->{recheck_req_gen} = $self->{recheck_req_gen};
+            return $slave;
+        }
     }
 
     return $self;
@@ -233,15 +238,15 @@ sub slaves_ok {
 
 sub recheck_dbh {
     my $self = shift;
-    $self->{needs_ping} = 1;
+    $self->{recheck_req_gen}++;
 }
 
 sub dbh {
     my $self = shift;
     if ($self->{dbh}) {
-        if ($self->{needs_ping}) {
-            $self->{needs_ping} = 0;
+        if ($self->{recheck_done_gen} != $self->{recheck_req_gen}) {
             $self->{dbh} = undef unless $self->{dbh}->ping;
+            $self->{recheck_done_gen} = $self->{recheck_req_gen};
         }
         return $self->{dbh} if $self->{dbh};
     }
@@ -285,7 +290,7 @@ sub _valid_params {
     my ($self, $vlist, %uarg) = @_;
     my %ret;
     $ret{$_} = delete $uarg{$_} foreach @$vlist;
-    croak("Bogus options") if %uarg;
+    croak("Bogus options: ".join(',',keys %uarg)) if %uarg;
     return %ret;
 }
 
@@ -306,16 +311,27 @@ sub conddup {
 }
 
 # insert row if doesn't already exist
+# WARNING: This function is NOT transaction safe if the duplicate errors causes
+# your transaction to halt!
+# WARNING: This function is NOT safe on multi-row inserts if can_insertignore
+# is false! Rows before the duplicate will be inserted, but rows after the
+# duplicate might not be, depending your database.
 sub insert_ignore {
     my ($self, $sql, @params) = @_;
     my $dbh = $self->dbh;
     if ($self->can_insertignore) {
         return $dbh->do("INSERT IGNORE $sql", @params);
     } else {
+        # TODO: Detect bad multi-row insert here.
         my $rv = eval { $dbh->do("INSERT $sql", @params); };
         if ($@ || $dbh->err) {
             return 1 if $self->was_duplicate_error;
-            die "DB error: " . $dbh->errstr;
+            # This chunk is identical to condthrow, but we include it directly
+            # here as we know there is definetly an error, and we would like
+            # the caller of this function.
+            my ($pkg, $fn, $line) = caller;
+            my $msg = "Database error from $pkg/$fn/$line: " . $dbh->errstr;
+            croak($msg);
         }
         return $rv;
     }
@@ -329,6 +345,11 @@ sub add_extra_tables {
     my $class = shift;
     push @extra_tables, @_;
 }
+
+use constant TABLES => qw( domain class file tempfile file_to_delete
+                            unreachable_fids file_on file_on_corrupt host
+                            device server_settings file_to_replicate
+                            file_to_delete_later fsck_log);
 
 sub setup_database {
     my $sto = shift;
@@ -353,12 +374,7 @@ sub setup_database {
         $sto->confirm("Install/upgrade your schema from version $curver to version $latestver?");
     }
 
-    foreach my $t (qw(
-                      domain class file tempfile file_to_delete
-                      unreachable_fids file_on file_on_corrupt host
-                      device server_settings file_to_replicate
-                      file_to_delete_later fsck_log
-                      ), @extra_tables) {
+    foreach my $t (TABLES, @extra_tables) {
         $sto->create_table($t);
     }
 
@@ -401,6 +417,9 @@ sub create_table {
     }
 }
 
+# Please try to keep all tables aligned nicely
+# with '"CREATE TABLE' on the first line
+# and ')"' alone on the last line.
 
 sub TABLE_domain {
     # classes are tied to domains.  domains can have classes of items
@@ -412,20 +431,21 @@ sub TABLE_domain {
     # unspecified classname means classid=0 (implicit class), and that
     # implies mindevcount=2
     "CREATE TABLE domain (
-   dmid         SMALLINT UNSIGNED NOT NULL PRIMARY KEY,
-   namespace    VARCHAR(255),
-   UNIQUE (namespace))"
+    dmid         SMALLINT UNSIGNED NOT NULL PRIMARY KEY,
+    namespace    VARCHAR(255),
+    UNIQUE (namespace)
+    )"
 }
 
 sub TABLE_class {
     "CREATE TABLE class (
-      dmid          SMALLINT UNSIGNED NOT NULL,
-      classid       TINYINT UNSIGNED NOT NULL,
-      PRIMARY KEY (dmid,classid),
-      classname     VARCHAR(50),
-      UNIQUE      (dmid,classname),
-      mindevcount   TINYINT UNSIGNED NOT NULL
-)"
+    dmid          SMALLINT UNSIGNED NOT NULL,
+    classid       TINYINT UNSIGNED NOT NULL,
+    PRIMARY KEY (dmid,classid),
+    classname     VARCHAR(50),
+    UNIQUE      (dmid,classname),
+    mindevcount   TINYINT UNSIGNED NOT NULL
+    )"
 }
 
 # the length field is only here for easy verifications of content
@@ -442,32 +462,32 @@ sub TABLE_class {
 # the application can recreate it from its original)
 sub TABLE_file {
     "CREATE TABLE file (
-   fid          INT UNSIGNED NOT NULL,
-   PRIMARY KEY  (fid),
+    fid          INT UNSIGNED NOT NULL,
+    PRIMARY KEY  (fid),
 
-   dmid          SMALLINT UNSIGNED NOT NULL,
-   dkey           VARCHAR(255),     # domain-defined
-   UNIQUE dkey  (dmid, dkey),
+    dmid          SMALLINT UNSIGNED NOT NULL,
+    dkey           VARCHAR(255),     # domain-defined
+    UNIQUE dkey  (dmid, dkey),
 
-   length        INT UNSIGNED,        # 4GB limit
+    length        INT UNSIGNED,        # 4GB limit
 
-   classid       TINYINT UNSIGNED NOT NULL,
-   devcount      TINYINT UNSIGNED NOT NULL,
-   INDEX devcount (dmid,classid,devcount)
-)"
+    classid       TINYINT UNSIGNED NOT NULL,
+    devcount      TINYINT UNSIGNED NOT NULL,
+    INDEX devcount (dmid,classid,devcount)
+    )"
 }
 
 sub TABLE_tempfile {
     "CREATE TABLE tempfile (
-   fid          INT UNSIGNED NOT NULL AUTO_INCREMENT,
-   PRIMARY KEY  (fid),
+    fid          INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    PRIMARY KEY  (fid),
 
-   createtime   INT UNSIGNED NOT NULL,
-   classid      TINYINT UNSIGNED NOT NULL,
-   dmid          SMALLINT UNSIGNED NOT NULL,
-   dkey           VARCHAR(255),
-   devids       VARCHAR(60)
-)"
+    createtime   INT UNSIGNED NOT NULL,
+    classid      TINYINT UNSIGNED NOT NULL,
+    dmid          SMALLINT UNSIGNED NOT NULL,
+    dkey           VARCHAR(255),
+    devids       VARCHAR(60)
+    )"
 }
 
 # files marked for death when their key is overwritten.  then they get a new
@@ -476,9 +496,9 @@ sub TABLE_tempfile {
 # all devices.
 sub TABLE_file_to_delete {
     "CREATE TABLE file_to_delete (
-   fid  INT UNSIGNED NOT NULL,
-   PRIMARY KEY (fid)
-)"
+    fid  INT UNSIGNED NOT NULL,
+    PRIMARY KEY (fid)
+    )"
 }
 
 # if the replicator notices that a fid has no sources, that file gets inserted
@@ -486,11 +506,11 @@ sub TABLE_file_to_delete {
 # handle fids stored in this table.
 sub TABLE_unreachable_fids {
     "CREATE TABLE unreachable_fids (
-   fid        INT UNSIGNED NOT NULL,
-   lastupdate INT UNSIGNED NOT NULL,
-   PRIMARY KEY (fid),
-   INDEX (lastupdate)
-)"
+    fid        INT UNSIGNED NOT NULL,
+    lastupdate INT UNSIGNED NOT NULL,
+    PRIMARY KEY (fid),
+    INDEX (lastupdate)
+    )"
 }
 
 # what files are on what devices?  (most likely physical devices,
@@ -500,11 +520,11 @@ sub TABLE_unreachable_fids {
 # the devid index lets us answer "What files were on this now-dead disk?"
 sub TABLE_file_on {
     "CREATE TABLE file_on (
-   fid          INT UNSIGNED NOT NULL,
-   devid        MEDIUMINT UNSIGNED NOT NULL,
-   PRIMARY KEY (fid, devid),
-   INDEX (devid)
-)"
+    fid          INT UNSIGNED NOT NULL,
+    devid        MEDIUMINT UNSIGNED NOT NULL,
+    PRIMARY KEY (fid, devid),
+    INDEX (devid)
+    )"
 }
 
 # if application or framework detects an error in one of the duplicate files
@@ -514,52 +534,53 @@ sub TABLE_file_on {
 #        on the other devices?
 sub TABLE_file_on_corrupt {
     "CREATE TABLE file_on_corrupt (
-   fid          INT UNSIGNED NOT NULL,
-   devid        MEDIUMINT UNSIGNED NOT NULL,
-   PRIMARY KEY (fid, devid)
-)"
+    fid          INT UNSIGNED NOT NULL,
+    devid        MEDIUMINT UNSIGNED NOT NULL,
+    PRIMARY KEY (fid, devid)
+    )"
 }
 
 # hosts (which contain devices...)
 sub TABLE_host {
     "CREATE TABLE host (
-   hostid     MEDIUMINT UNSIGNED NOT NULL PRIMARY KEY,
+    hostid     MEDIUMINT UNSIGNED NOT NULL PRIMARY KEY,
 
-   status     ENUM('alive','dead','down'),
-   http_port  MEDIUMINT UNSIGNED DEFAULT 7500,
-   http_get_port MEDIUMINT UNSIGNED,
+    status     ENUM('alive','dead','down'),
+    http_port  MEDIUMINT UNSIGNED DEFAULT 7500,
+    http_get_port MEDIUMINT UNSIGNED,
 
-   hostname   VARCHAR(40),
-   hostip     VARCHAR(15),
-   altip      VARCHAR(15),
-   altmask    VARCHAR(18),
-   UNIQUE     (hostname),
-   UNIQUE     (hostip),
-   UNIQUE     (altip)
-)"
+    hostname   VARCHAR(40),
+    hostip     VARCHAR(15),
+    altip      VARCHAR(15),
+    altmask    VARCHAR(18),
+    UNIQUE     (hostname),
+    UNIQUE     (hostip),
+    UNIQUE     (altip)
+    )"
 }
 
 # disks...
 sub TABLE_device {
     "CREATE TABLE device (
-   devid   MEDIUMINT UNSIGNED NOT NULL,
-   hostid     MEDIUMINT UNSIGNED NOT NULL,
+    devid   MEDIUMINT UNSIGNED NOT NULL,
+    hostid     MEDIUMINT UNSIGNED NOT NULL,
 
-   status  ENUM('alive','dead','down'),
-   weight  MEDIUMINT DEFAULT 100,
+    status  ENUM('alive','dead','down'),
+    weight  MEDIUMINT DEFAULT 100,
 
-   mb_total   MEDIUMINT UNSIGNED,
-   mb_used    MEDIUMINT UNSIGNED,
-   mb_asof    INT UNSIGNED,
-   PRIMARY KEY (devid),
-   INDEX   (status)
-)"
+    mb_total   MEDIUMINT UNSIGNED,
+    mb_used    MEDIUMINT UNSIGNED,
+    mb_asof    INT UNSIGNED,
+    PRIMARY KEY (devid),
+    INDEX   (status)
+    )"
 }
 
 sub TABLE_server_settings {
     "CREATE TABLE server_settings (
-   field   VARCHAR(50) PRIMARY KEY,
-   value   VARCHAR(255))"
+    field   VARCHAR(50) PRIMARY KEY,
+    value   VARCHAR(255)
+    )"
 }
 
 sub TABLE_file_to_replicate {
@@ -571,33 +592,33 @@ sub TABLE_file_to_replicate {
     # failcount.  how many times we've failed, just for doing backoff of nexttry.
     # flags.  reserved for future use.
     "CREATE TABLE file_to_replicate (
-   fid        INT UNSIGNED NOT NULL PRIMARY KEY,
-   nexttry    INT UNSIGNED NOT NULL,
-   INDEX (nexttry),
-   fromdevid  INT UNSIGNED,
-   failcount  TINYINT UNSIGNED NOT NULL DEFAULT 0,
-   flags      SMALLINT UNSIGNED NOT NULL DEFAULT 0
-   )"
+    fid        INT UNSIGNED NOT NULL PRIMARY KEY,
+    nexttry    INT UNSIGNED NOT NULL,
+    INDEX (nexttry),
+    fromdevid  INT UNSIGNED,
+    failcount  TINYINT UNSIGNED NOT NULL DEFAULT 0,
+    flags      SMALLINT UNSIGNED NOT NULL DEFAULT 0
+    )"
 }
 
 sub TABLE_file_to_delete_later {
     "CREATE TABLE file_to_delete_later (
-   fid  INT UNSIGNED NOT NULL PRIMARY KEY,
-   delafter INT UNSIGNED NOT NULL,
-   INDEX (delafter)
-)"
+    fid  INT UNSIGNED NOT NULL PRIMARY KEY,
+    delafter INT UNSIGNED NOT NULL,
+    INDEX (delafter)
+    )"
 }
 
 sub TABLE_fsck_log {
     "CREATE TABLE fsck_log (
-logid  INT UNSIGNED NOT NULL AUTO_INCREMENT,
-PRIMARY KEY (logid),
-utime  INT UNSIGNED NOT NULL,
-fid    INT UNSIGNED NULL,
-evcode CHAR(4),
-devid  MEDIUMINT UNSIGNED,
-INDEX(utime)
-)"
+    logid  INT UNSIGNED NOT NULL AUTO_INCREMENT,
+    PRIMARY KEY (logid),
+    utime  INT UNSIGNED NOT NULL,
+    fid    INT UNSIGNED NULL,
+    evcode CHAR(4),
+    devid  MEDIUMINT UNSIGNED,
+    INDEX(utime)
+    )"
 }
 
 # these five only necessary for MySQL, since no other database existed
@@ -695,6 +716,7 @@ sub nfiles_with_dmid_classid_devcount {
 sub set_server_setting {
     my ($self, $key, $val) = @_;
     my $dbh = $self->dbh;
+    die "Your database does not support REPLACE! Reimplement set_server_setting!" unless $self->can_replace;
 
     if (defined $val) {
         $dbh->do("REPLACE INTO server_settings (field, value) VALUES (?, ?)", undef, $key, $val);
@@ -761,9 +783,23 @@ sub register_tempfile {
     # one.  that should be fine.
     my $ins_tempfile = sub {
         my $rv = eval {
-            $dbh->do("INSERT INTO tempfile (fid, dmid, dkey, classid, devids, createtime) VALUES ".
-                     "(?,?,?,?,?," . $self->unix_timestamp . ")",
-                     undef, $fid || undef, $arg{dmid}, $arg{key}, $arg{classid} || 0, $arg{devids});
+            # We must only pass the correct number of bind parameters
+            # Using 'NULL' for the AUTO_INCREMENT/SERIAL column will fail on
+            # Postgres, where you are expected to leave it out or use DEFAULT
+            # Leaving it out seems sanest and least likely to cause problems
+            # with other databases.
+            my @keys = ('dmid', 'dkey', 'classid', 'devids', 'createtime');
+            my @vars = ('?'   , '?'   , '?'      , '?'     , $self->unix_timestamp);
+            my @vals = ($arg{dmid}, $arg{key}, $arg{classid} || 0, $arg{devids});
+            # Do not check for $explicit_fid_used, but rather $fid directly
+            # as this anonymous sub is called from the loop later
+            if($fid) {
+                unshift @keys, 'fid';
+                unshift @vars, '?';
+                unshift @vals, $fid;
+            }
+            my $sql = "INSERT INTO tempfile (".join(',',@keys).") VALUES (".join(',',@vars).")";
+            $dbh->do($sql, undef, @vals);
         };
         if (!$rv) {
             return undef if $self->was_duplicate_error;
@@ -773,7 +809,7 @@ sub register_tempfile {
         unless (defined $fid) {
             # if they did not give us a fid, then we want to grab the one that was
             # theoretically automatically generated
-            $fid = $dbh->last_insert_id(undef, undef, undef, undef)
+            $fid = $dbh->last_insert_id(undef, undef, 'tempfile', 'fid')
                 or die "No last_insert_id found";
         }
         return undef unless defined $fid && $fid > 0;
@@ -823,13 +859,22 @@ sub file_row_from_dmid_key {
 }
 
 # return hashref of row containing columns "fid, dmid, dkey, length,
-# classid, devcount" provided a $dmid and $key (dkey).  or undef if no
-# row.
+# classid, devcount" provided a $fidid or undef if no row.
 sub file_row_from_fidid {
     my ($self, $fidid) = @_;
     return $self->dbh->selectrow_hashref("SELECT fid, dmid, dkey, length, classid, devcount ".
                                          "FROM file WHERE fid=?",
                                          undef, $fidid);
+}
+
+# return an arrayref of rows containing columns "fid, dmid, dkey, length,
+# classid, devcount" provided a pair of $fidid or undef if no rows.
+sub file_row_from_fidid_range {
+    my ($self, $fromfid, $tofid) = @_;
+	my $sth = $self->dbh->prepare("SELECT fid, dmid, dkey, length, classid, devcount ".
+								  "FROM file WHERE fid BETWEEN ? AND ?");
+    $sth->execute($fromfid,$tofid);
+    return $sth->fetchall_arrayref({});
 }
 
 # return array of devids that a fidid is on
@@ -882,6 +927,7 @@ sub update_device_usage {
 
 sub mark_fidid_unreachable {
     my ($self, $fidid) = @_;
+    die "Your database does not support REPLACE! Reimplement mark_fidid_unreachable!" unless $self->can_replace;
     $self->dbh->do("REPLACE INTO unreachable_fids VALUES (?, " . $self->unix_timestamp . ")",
                    undef, $fidid);
 }
@@ -923,6 +969,7 @@ sub delete_tempfile_row {
 sub replace_into_file {
     my $self = shift;
     my %arg  = $self->_valid_params([qw(fidid dmid key length classid)], @_);
+    die "Your database does not support REPLACE! Reimplement replace_into_file!" unless $self->can_replace;
     $self->dbh->do("REPLACE INTO file (fid, dmid, dkey, length, classid, devcount) ".
                    "VALUES (?,?,?,?,?,0) ", undef,
                    @arg{'fidid', 'dmid', 'key', 'length', 'classid'});
@@ -975,6 +1022,9 @@ sub add_fidid_to_devid {
     croak("fidid not non-zero") unless $fidid;
     croak("devid not non-zero") unless $devid;
 
+    # TODO: This should possibly be insert_ignore instead
+    # As if we are adding an extra file_on entry, we do not want to replace the
+    # exist one. Check REPLACE semantics.
     my $rv = $self->dowell($self->ignore_replace . " INTO file_on (fid, devid) VALUES (?,?)",
                            undef, $fidid, $devid);
     return 1 if $rv > 0;
@@ -1228,6 +1278,9 @@ sub mass_insert_file_on {
         push @qmarks, "(?,?)";
     }
 
+    # TODO: This should possibly be insert_ignore instead
+    # As if we are adding an extra file_on entry, we do not want to replace the
+    # exist one. Check REPLACE semantics.
     $self->dowell($self->ignore_replace . " INTO file_on (fid, devid) VALUES " . join(',', @qmarks), undef, @binds);
     return 1;
 }
@@ -1252,10 +1305,14 @@ sub fids_to_delete_again {
 # return 1 on success.  die otherwise.
 sub enqueue_fids_to_delete {
     my ($self, @fidids) = @_;
-    if (@fidids > 1 && ! $self->can_insert_multi) {
+    # multi-row insert-ignore/replace CAN fail with the insert_ignore emulation sub.
+    # when the first row causes the duplicate error, and the remaining rows are
+    # not processed.
+    if (@fidids > 1 && ! ($self->can_insert_multi && ($self->can_replace || $self->can_insertignore))) {
         $self->enqueue_fids_to_delete($_) foreach @fidids;
         return 1;
     }
+    # TODO: convert to prepared statement?
     $self->dbh->do($self->ignore_replace . " INTO file_to_delete (fid) VALUES " .
                    join(",", map { "(" . int($_) . ")" } @fidids))
         or die "file_to_delete insert failed";
@@ -1281,7 +1338,7 @@ sub fsck_log {
                    delete $opts{devid});
     croak("Unknown opts") if %opts;
 
-    my $logid = $self->dbh->last_insert_id(undef, undef, undef, undef)
+    my $logid = $self->dbh->last_insert_id(undef, undef, 'fsck_log', 'logid')
         or die "No last_insert_id found for fsck_log table";
 
     # sum-up evcode counts every so often, to make fsck_status faster,
@@ -1408,6 +1465,18 @@ sub random_fids_on_device {
     return @some_fids;
 }
 
+# return array of { dmid => ..., classid => ..., devcount => ..., count => ... }
+sub get_stats_files_per_devcount {
+    my ($self) = @_;
+    my $dbh = $self->dbh;
+    my @ret;
+    my $sth = $dbh->prepare('SELECT dmid, classid, devcount, COUNT(devcount) AS "count" FROM file GROUP BY 1, 2, 3');
+    $sth->execute;
+    while (my $row = $sth->fetchrow_hashref) {
+        push @ret, $row;
+    }
+    return @ret;
+}
 
 1;
 

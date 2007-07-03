@@ -2,7 +2,7 @@ package MogileFS::Server;
 use strict;
 use warnings;
 use vars qw($VERSION);
-$VERSION = "2.16";
+$VERSION = "2.17";
 
 =head1 NAME
 
@@ -200,6 +200,7 @@ sub run_global_hook {
 package Mgd;  # conveniently short name
 use strict;
 use warnings;
+use MogileFS::Config;
 use MogileFS::Util qw(error fatal debug); # for others calling Mgd::foo()
 
 sub server {
@@ -233,7 +234,10 @@ sub log {
     if (! $MogileFS::Config::daemonize) {
         # syslog acts like printf so we have to use printf and append a \n
         shift; # ignore the first parameter (info, warn, critical, etc)
-        printf(shift(@_) . "\n", @_);
+        my $mask = shift; # format string
+        $mask .= "\n" unless $mask =~ /\n$/;
+        my $message = @_ ? sprintf($mask, @_) : $mask;
+        print $message;
     } else {
         # just pass the parameters to syslog
         Sys::Syslog::syslog(@_);

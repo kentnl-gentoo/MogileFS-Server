@@ -6,6 +6,7 @@ use fields (
             'last_stop_check',     # unixtime 'should_stop_running' last called
             'last_maxcheck_write', # unixtime maxcheck written
             'size_checker',        # subref which, given a DevFID, returns size of file
+            'opt_nostat',          # bool: do we trust mogstoreds? skipping size stats?
             );
 use MogileFS::Util qw(every error debug);
 use List::Util ();
@@ -49,7 +50,7 @@ sub work {
     my $stats = sub {
         return unless $running;
         my $elap = $nowish - $running;
-        debug("[fsck] In %d secs, %d fids, %0.02f fids/sec\n", $elap, $n_check, ($n_check / ($elap || 1)));
+        debug(sprintf("In %d secs, %d fids, %0.02f fids/sec\n", $elap, $n_check, ($n_check / ($elap || 1))));
     };
     my $last_beat = 0;
     my $beat = sub {
@@ -60,7 +61,7 @@ sub work {
     my $stop = sub {
         return unless $running;
         $stats->();
-        debug("[fsck] done.");
+        debug("done.");
         $running = 0;
     };
     # </debug crap>
@@ -72,6 +73,7 @@ sub work {
         my $sleep_set = shift;
         $self->parent_ping;
         $nowish = time();
+        local $Mgd::nowish = $nowish;
 
         # see if we're even enabled for this host.
         unless ($self->should_be_running) {
@@ -84,13 +86,13 @@ sub work {
         unless ($self->monitor_has_run) {
             # only warn on runs after the first.  gives the monitor job some time to work
             # before we throw a message.
-            debug("[fsck] waiting for monitor job to complete a cycle before beginning")
+            debug("waiting for monitor job to complete a cycle before beginning")
                 if $run_count++ > 0;
             return;
         }
 
         $max_checked ||= MogileFS::Config->server_setting('fsck_highest_fid_checked') || 0;
-        my $opt_nostat = MogileFS::Config->server_setting('fsck_opt_policy_only')     || 0;
+        $self->{opt_nostat} = MogileFS::Config->server_setting('fsck_opt_policy_only')     || 0;
         my @fids       = $sto->get_fids_above_id($max_checked, 5000);
 
         unless (@fids) {
@@ -112,11 +114,10 @@ sub work {
 
         my $new_max;
         my $hit_problem = 0;
+
         foreach my $fid (@fids) {
-            $nowish = time();
-            $self->still_alive;
             last if $self->should_stop_running;
-            if (!$self->check_fid($fid, no_stat => $opt_nostat)) {
+            if (!$self->check_fid($fid)) {
                 # some connectivity problem... abort checking more
                 # for now.
                 $hit_problem = 1;
@@ -130,7 +131,7 @@ sub work {
 
         # if we had connectivity problems, let's sleep a bit
         if ($hit_problem) {
-            error("[fsck] connectivity problems; stalling 5s");
+            error("connectivity problems; stalling 5s");
             sleep 5;
         }
     });
@@ -173,9 +174,7 @@ sub should_stop_running {
 use constant STALLED => 0;
 use constant HANDLED => 1;
 sub check_fid {
-    my ($self, $fid, %opts) = @_;
-    my $opt_no_stat = delete $opts{no_stat};
-    die "badopts" if %opts;
+    my ($self, $fid) = @_;
 
     my $fix = sub {
         my $fixed = eval { $self->fix_fid($fid) };
@@ -184,6 +183,9 @@ sub check_fid {
             return STALLED;
         }
         $fid->fsck_log(EV_CANT_FIX) if ! $fixed;
+
+        # that might've all taken awhile, let's update our approximate time
+        $nowish = $self->still_alive;
         return HANDLED;
     };
 
@@ -208,38 +210,45 @@ sub check_fid {
     # in the fast case, do nothing else (don't check if assumed file
     # locations are actually there).  in the fast case, all we do is
     # check the replication policy, which is already done, so finish.
-    return HANDLED if $opt_no_stat;
+    return HANDLED if $self->{opt_nostat};
 
     # stat each device to see if it's still there.  on first problem,
     # stop and go into the slow(er) fix function.
-    foreach my $devid ($fid->devids) {
-        # setup and do the request.  these failures are total failures in that we expect
-        # them to work again later, as it's probably transient and will persist no matter
-        # how many paths we try.
-        my $dfid = MogileFS::DevFID->new($devid, $fid);
-        my $dev  = $dfid->device;
-
-        my $disk_size = $self->size_on_disk($dfid);
-
+    my $err;
+    my $rv = $self->parallel_check_sizes([ $fid->devfids ], sub {
+        my ($dfid, $disk_size) = @_;
         if (! defined $disk_size) {
+            my $dev  = $dfid->device;
             error("Connectivity problem reaching device " . $dev->id . " on host " . $dev->host->ip . "\n");
-            return STALLED;
+            $err = "stalled";
+            return 0;
         }
-
-        # great, check the size against what's in the database
-        if ($disk_size == $fid->length) {
-            # yay!
-            next;
-        }
-
+        return 1 if $disk_size == $fid->length;
+        $err = "needfix";
         # Note: not doing fsck_log, as fix_fid will log status for each device.
+        return 0;
+    });
 
-        # no point continuing loop now, once we find one problem.
-        # fix_fid will fully check all devices...
+    if ($rv) {
+        return HANDLED;
+    } elsif ($err eq "stalled") {
+        return STALLED;
+    } elsif ($err eq "needfix") {
         return $fix->();
+    } else {
+        die "Unknown error checking fid sizes in parallel.\n";
     }
+}
 
-    return HANDLED;
+sub parallel_check_sizes {
+    my ($self, $dflist, $cb) = @_;
+    # serial, for now: (just prepping for future parallel future,
+    # getting interface right)
+    foreach my $df (@$dflist) {
+        my $size = $self->size_on_disk($df);
+        return 0 unless $cb->($df, $size);
+    }
+    return 1;
 }
 
 # this is the slow path.  if something above in check_fid finds
@@ -322,7 +331,7 @@ sub fix_fid {
 
     # remove the file_on mappings for devices that were bogus/missing.
     foreach my $bdev (@bad_devs) {
-        error("[fsck] removing file_on mapping for fid=" . $fid->id . ", dev=" . $bdev->id);
+        error("removing file_on mapping for fid=" . $fid->id . ", dev=" . $bdev->id);
         $fid->forget_about_device($bdev);
     }
 
@@ -339,6 +348,8 @@ sub fix_fid {
 
 sub init_size_checker {
     my ($self, $fidlist) = @_;
+
+    $self->still_alive;
 
     my $lo_fid = $fidlist->[0]->id;
     my $hi_fid = $fidlist->[-1]->id;
@@ -378,6 +389,11 @@ sub init_size_checker {
                         last;
                     }
                 }
+
+                # we only update our $nowish (approximate time) lazily, when we
+                # know time might've advanced (like during potentially slow RPC call)
+                $nowish = $self->still_alive;
+
                 if ($good) {
                     $size{$devid} = $map;
                     return $map->{$dfid->fidid} || 0;
@@ -387,9 +403,11 @@ sub init_size_checker {
                     $mogconn->mark_dead;
                 }
             }
-            error("[fsck] fid_sizes mogstored cmd unavailable for dev $devid; using slower method");
+            error("fid_sizes mogstored cmd unavailable for dev $devid; using slower method");
         }
 
+        # slow case (not using new command)
+        $nowish = $self->still_alive;
         return $dfid->size_on_disk;
     };
 }

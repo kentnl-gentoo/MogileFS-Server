@@ -90,7 +90,7 @@ sub process_tempfiles {
 
     # dig up some temporary files to purge
     my $sto = Mgd::get_store();
-    my $too_old = int($ENV{T_TEMPFILE_TOO_OLD}) || 3600;
+    my $too_old = int($ENV{T_TEMPFILE_TOO_OLD} || 3600);
     my $tempfiles = $sto->old_tempfiles($too_old);
     return 0 unless $tempfiles && @$tempfiles;
 
@@ -137,7 +137,7 @@ sub process_deletes {
         $self->still_alive;
         $self->read_from_parent;
         my ($fid, $devid) = @$dm;
-        error("deleting fid $fid, on devid $devid...") if $Mgd::DEBUG >= 2;
+        error("deleting fid $fid, on devid ".($devid || 'NULL')."...") if $Mgd::DEBUG >= 2;
 
         my $done_with_fid = sub {
             my $reason = shift;
@@ -155,10 +155,9 @@ sub process_deletes {
 
         my $reschedule_fid = sub {
             my ($secs, $reason) = (int(shift), shift);
-            $dbh->do("INSERT IGNORE INTO file_to_delete_later (fid, delafter) ".
-                     "VALUES (?,UNIX_TIMESTAMP()+$secs)", undef,
-                     $fid);
-            $sto->condthrow("Failure to insert into file_to_delete_later");
+            $sto->insert_ignore("INTO file_to_delete_later (fid, delafter) ".
+                "VALUES (?,".$sto->unix_timestamp."+$secs)", undef,
+                $fid);
             error("delete of fid $fid rescheduled: $reason") if $Mgd::DEBUG >= 2;
             $done_with_fid->("rescheduled");
         };
@@ -194,8 +193,8 @@ sub process_deletes {
             next;
         }
 
-        # CASE: devid is marked readonly/down: delay for 2 hours
-        if ($dev->status ne "alive") {
+        # CASE: devid is marked readonly/down/etc: delay for 2 hours
+        unless ($dev->can_delete_from) {
             $reschedule_fid->(60 * 60 * 2, "devid_marked_not_alive");
             next;
         }

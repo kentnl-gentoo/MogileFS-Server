@@ -1,3 +1,90 @@
+2007-07-03: Release version 2.17
+
+        * get_paths command now takes a pathcount option, defaulting to
+          2, instead of having a hardcoded constant of 2. This allows
+          requesting more than 2 paths to a file.
+
+        * make fsck log over-replicated files as policy violations.  it
+          won't delete over-replicated files, though, just log
+
+        * Document how to test MogileFS under doc/testing.txt. You really
+          should read this if you want to use MogileFS to store your data.
+
+        * Add a safety check to ensure that Postgresql-8.2 or newer is used.
+
+        * Update mogdbsetup usage, and ensure it choses the correct admin
+          username automatically.
+
+        * Document the --type option to mogdbsetup.
+
+        * Introduce the Postgres Store implementation. The locking system might
+          still have issues, beware of stale locks! Initial prototype by Radu
+          Greab <rg@yx.ro>, and developed heavily by Robin H. Johnson
+          <robbat2@gentoo.org>.
+
+        * start of support to make mogstored wrap Apache + web_dav
+
+        * Remove duplicated [fsck] in log output of Fsck worker.
+
+        * Handle HiRes gettimeofday correctly to get useful results. Arrays are
+          important. This gives us correct timing output.
+
+        * Handle input to log() correctly. Based on the implementation of
+          Sys::Syslog::syslog(), produces no ugly warnings, and makes sure that
+          printf stuff works nicely.
+
+        * The unix_timestamp function belongs to the Store, not other classes.
+          Need to add testcases for process_deletes and stats.
+
+        * Using NULL during an INSERT for the AUTO_INCREMENT column does not
+          work very well outside of MySQL. Pass the correct number of arguments
+          to the INSERT instead.
+
+        * Clean up all raw usages of UNIX_TIMETAMP() function, in preparation
+          for database independence. If you need the unix timestamp, include the output
+          of $self->unix_timestamp directly into your query.
+
+        * Alter $0 so that the scripts show up as '$SCRIPTNAME' in the process
+          listing instead of '/usr/bin/perl $SCRIPTNAME'. This makes init.d
+          scripts easier to manage.
+
+        * make mogstored's lighttpd config use mod_status for "/", so
+          mogadm doesn't think it's dead when it previously saw a 404
+          (Justin Huff <jjhuff@mspin.net>)
+
+        * remove Linux::AIO support, now that Perlbal has removed it as well,
+          and because Linux::AIO support (when Perlbal then chooses
+          IO::AIO) was hanging mogstored on shutdown.  so also add a
+          mogstored shutdown test (after a full daemonization of it)
+
+        * make Mgd::validate_dbh() re-check/ping slave dbhs as well.
+          (problem mentioned by Steven Shou <steven.shou@verizon.net>)
+
+        * support drive identifiers above sdz (Arjan <info@bouncetek.com>)
+
+        * make mogstored's iostat child process properly shutdown,
+          even when iostat binary isn't installed.  (previously
+          it was stuck in a loop every 10 seconds, hoping for
+          iostat to be installed, but never respecting parent
+          process' death)
+
+        * Change delete worker to use new DeviceStates interface.
+
+        * Fix get_paths to honor new device state of 'drain' via new
+          DeviceStates interface.
+
+        * use signifigantly less CPU when re-broadcasting around
+          iostat device utilization% to child processes.  (future:
+          don't rebroadcast at all and use shared memory)
+
+        * slightly faster fsck (do less syscalls)
+
+        * efficiency: don't broadcast dup state information to children
+          (track in parent what children know already)
+
+        * if using Gearman::Server >= 1.09, respawn the fidsizes
+          worker if it dies.
+
 2007-05-09: Release version 2.16
 
         * BUG FIX from 2.15:  partially written but never closed

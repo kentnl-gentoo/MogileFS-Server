@@ -10,6 +10,8 @@ use fields ('psock',              # socket for parent/child communications
             );
 
 use MogileFS::Util qw(error);
+use MogileFS::Server;
+
 use vars (
           '$got_live_vs_die',    # local'ized scalarref flag for whether we've
                                  # gotten a live-vs-die instruction from parent
@@ -64,6 +66,7 @@ sub wait_for_monitor {
 
 # method that workers can call just to write something to the parent, so worker
 # doesn't get killed.  (during idle/slow operation, say)
+# returns current time, so caller can avoid a time() call as well, for its loop
 sub still_alive {
     my $self = shift;
     my $now = time();
@@ -71,6 +74,7 @@ sub still_alive {
         $self->send_to_parent(":still_alive");  # a no-op, just for the watchdog
         $self->{last_ping} = $now;
     }
+    return $now;
 }
 
 sub send_to_parent {
@@ -268,10 +272,15 @@ sub process_generic_command {
         return 1;
     }
 
-    if (my ($devid, $util) = $$lineref =~ /^:set_dev_utilization (\d+) (.+)/) {
-        my $dev = MogileFS::Device->of_devid($devid);
+    # :set_dev_utilization dev# 45.2 dev# 45.2 dev# 45.2 dev# 45.2 dev 45.2\n
+    # (dev#, utilz%)+
+    if (my ($devid, $util) = $$lineref =~ /^:set_dev_utilization (.+)/) {
+        my %pairs = split(/\s+/, $1);
         local $MogileFS::Device::util_no_broadcast = 1;
-        $dev->set_observed_utilization($util);
+        while (my ($devid, $util) = each %pairs) {
+            my $dev = eval { MogileFS::Device->of_devid($devid) } or next;
+            $dev->set_observed_utilization($util);
+        }
         return 1;
     }
 

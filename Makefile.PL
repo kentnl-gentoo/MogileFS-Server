@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 #   Perl Makefile for Danga-Socket
-#   $Id: Makefile.PL 976 2007-05-07 09:20:52Z bradfitz $
+#   $Id: Makefile.PL 987 2007-05-09 22:13:56Z bradfitz $
 #
 #   Invoke with 'perl Makefile.PL'
 #
@@ -30,7 +30,7 @@ WriteMakefile(
         'Getopt::Long'     => 0,
         'Symbol'           => 0,
         'Net::Netmask'     => 0,
-        'Gearman::Server'  => 1.08,
+        'Gearman::Server'  => 1.08,  # but really want at least 1.09
         'Gearman::Client::Async' => 0.93,
         'Gearman::Client' => 1.07,  # for Gearman::Worker, in fidsizes worker
         fields            => 0,

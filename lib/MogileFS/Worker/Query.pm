@@ -90,7 +90,9 @@ sub process_line {
     # set global variables for zone determination
     local $MogileFS::REQ_client_ip = $client_ip;
 
-    $self->{querystarttime} = Time::HiRes::gettimeofday();
+    # Use as array here, otherwise we get a string which breaks usage of
+    # Time::HiRes::tv_interval further on.
+    $self->{querystarttime} = [ Time::HiRes::gettimeofday() ];
 
     # fallback to normal command handling
     if ($line =~ /^(\w+)\s*(.*)/) {
@@ -435,14 +437,14 @@ sub cmd_list_fids {
     my $args = shift;
 
     # validate parameters
-    my $fromfid = $args->{from}+0;
-    my $tofid = $args->{to}+0;
+    my $fromfid = ($args->{from} || 0)+0;
+    my $tofid = ($args->{to} || 0)+0;
     $tofid ||= ($fromfid + 100);
     $tofid = ($fromfid + 100)
         if $tofid > $fromfid + 100 ||
            $tofid < $fromfid;
 
-    my $rows = Mgd::get_store()->file_row_from_fid_range($fromfid, $tofid);
+    my $rows = Mgd::get_store()->file_row_from_fidid_range($fromfid, $tofid);
     return $self->err_line('failure') unless $rows;
     return $self->ok_line({ fid_count => 0 }) unless @$rows;
 
@@ -803,7 +805,7 @@ sub cmd_get_paths {
 
     # memcache mappings are as follows:
     #  mogfid:<dmid>:<dkey> -> fidid     (and TODO: invalidate this when key is replaced)
-    #  mogdevids:<fidid>    -> \@devids
+    #  mogdevids:<fidid>    -> \@devids  (and TODO: invalidate when the replication or deletion is run!)
 
     # if you specify 'noverify', that means a correct answer isn't needed and memcache can
     # be used.
@@ -822,6 +824,11 @@ sub cmd_get_paths {
     # validate parameters
     my $dmid = $args->{dmid};
     my $key = $args->{key} or return $self->err_line("no_key");
+
+    # We default to returning two possible paths.
+    # but the client may ask for more if they want.
+    my $pathcount = $args->{pathcount} || 2;
+    $pathcount = 2 if $pathcount < 2;
 
     # get DB handle
     my $fid;
@@ -874,8 +881,9 @@ sub cmd_get_paths {
     foreach my $devid (@fid_devids) {
         my $weight;
         my $dev = $dmap->{$devid};
+        my $util = $dev->observed_utilization;
 
-        if (defined(my $util = $dev->observed_utilization)) {
+        if (defined($util) and $util =~ /\A\d+\Z/) {
             $weight = 102 - $util;
             $weight ||= 100;
         } else {
@@ -894,7 +902,7 @@ sub cmd_get_paths {
     # construct result paths
     foreach my $devid (@list) {
         my $dev = $dmap->{$devid};
-        next unless $dev && ($dev->status eq "alive" || $dev->status eq "readonly");
+        next unless $dev && ($dev->can_read_from);
 
         my $host = $dev->host;
         next unless $dev && $host;
@@ -916,7 +924,7 @@ sub cmd_get_paths {
 
         my $n = ++$ret->{paths};
         $ret->{"path$n"} = $path;
-        last if $n == 2;   # one verified, one likely seems enough for now.  time will tell.
+        last if $n == $pathcount;   # one verified, one likely seems enough for now.  time will tell.
     }
 
     # use our backup path if all else fails
@@ -967,12 +975,15 @@ sub cmd_set_state {
     return $self->ok_line;
 }
 
+# FIXME: this whole thing is gross, duplicative, dependendent on $dbh, and doesn't scale.
+# stats needs total overhaul to not suck.
 sub cmd_stats {
     my MogileFS::Worker::Query $self = shift;
     my $args = shift;
 
     # get database handle
     my $ret = {};
+    my $sto = Mgd::get_store();
     my $dbh = Mgd::get_dbh()
         or return $self->err_line('nodb');
 
@@ -1001,20 +1012,22 @@ sub cmd_stats {
     # if they want replication counts, or didn't specify what they wanted
     if ($args->{replication} || $args->{all}) {
         # replication stats
-        my $stats = $dbh->selectall_arrayref('SELECT dmid, classid, devcount, COUNT(devcount) FROM file GROUP BY 1, 2, 3');
+        # This is the old version that used devcount:
+        my @stats = $sto->get_stats_files_per_devcount;
+
         my $count = 0;
-        foreach my $stat (@$stats) {
+        foreach my $stat (@stats) {
             $count++;
-            $ret->{"replication${count}domain"} = $classes{$stat->[0]}->{name};
-            $ret->{"replication${count}class"} = $classes{$stat->[0]}->{classes}->{$stat->[1]};
-            $ret->{"replication${count}devcount"} = $stat->[2];
-            $ret->{"replication${count}files"} = $stat->[3];
+            $ret->{"replication${count}domain"} = $classes{$stat->{dmid}}->{name};
+            $ret->{"replication${count}class"} = $classes{$stat->{dmid}}->{classes}->{$stat->{classid}};
+            $ret->{"replication${count}devcount"} = $stat->{devcount};
+            $ret->{"replication${count}files"} = $stat->{count};
         }
         $ret->{"replicationcount"} = $count;
 
         # now we want to do the "new" replication stats
-        my $db_time = $dbh->selectrow_array('SELECT UNIX_TIMESTAMP()');
-        $stats = $dbh->selectall_arrayref('SELECT nexttry, COUNT(*) FROM file_to_replicate GROUP BY 1');
+        my $db_time = $dbh->selectrow_array('SELECT '.$sto->unix_timestamp);
+        my $stats = $dbh->selectall_arrayref('SELECT nexttry, COUNT(*) FROM file_to_replicate GROUP BY 1');
         foreach my $stat (@$stats) {
             if ($stat->[0] < 1000) {
                 # anything under 1000 is a specific state, so let's define those.  here's the list
@@ -1295,7 +1308,7 @@ sub ok_line {
 
     my $delay = '';
     if ($self->{querystarttime}) {
-        $delay = sprintf("%.4f ", Time::HiRes::tv_interval([ $self->{querystarttime} ]));
+        $delay = sprintf("%.4f ", Time::HiRes::tv_interval( $self->{querystarttime} ));
         $self->{querystarttime} = undef;
     }
 
@@ -1351,7 +1364,7 @@ sub err_line {
 
     my $delay = '';
     if ($self->{querystarttime}) {
-        $delay = sprintf("%.4f ", Time::HiRes::tv_interval([ $self->{querystarttime} ]));
+        $delay = sprintf("%.4f ", Time::HiRes::tv_interval($self->{querystarttime}));
         $self->{querystarttime} = undef;
     }
 
