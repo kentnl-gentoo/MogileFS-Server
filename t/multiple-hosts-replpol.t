@@ -8,7 +8,7 @@ use FindBin qw($Bin);
 use MogileFS::Server;
 use MogileFS::Util qw(error_code);
 use MogileFS::ReplicationPolicy::MultipleHosts;
-require "$Bin/lib/mogtestlib.pl";
+use MogileFS::Test;
 
 plan tests => 13;
 
@@ -20,7 +20,7 @@ is(rr("min=2  h1[d1=X d2=_] h2[d3=X d4=_]"),
 is(rr("min=2  h1[d1=X d2=_] h2[d3=_ d4=_]"),
    "ideal(3,4)", "need host2");
 
-# still needs to be on host2, even though 2 coies on host1
+# still needs to be on host2, even though 2 copies on host1
 is(rr("min=2  h1[d1=X d2=X] h2[d3=_ d4=_]"),
    "ideal(3,4)", "need host2, even though 2 on host1");
 
@@ -108,7 +108,8 @@ sub rr {
     }
     $parse_error->() if $state =~ /\S/;
 
-    my $pol = "MogileFS::ReplicationPolicy::MultipleHosts";
+    my $polclass = "MogileFS::ReplicationPolicy::MultipleHosts";
+    my $pol = $polclass->new;
     my $rr = $pol->replicate_to(
                                 fid      => 1,
                                 on_devs  => $on_devs,

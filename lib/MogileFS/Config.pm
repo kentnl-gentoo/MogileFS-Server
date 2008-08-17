@@ -23,7 +23,7 @@ sub set_config {
     shift if @_ == 3;
     my ($k, $v) = @_;
 
-    # if a child, propogate to parent
+    # if a child, propagate to parent
     if (my $worker = MogileFS::ProcManager->is_child) {
         $worker->send_to_parent(":set_config_from_child $k $v");
     } else {
@@ -64,6 +64,7 @@ our (
     $node_timeout,          # time in seconds to wait for storage node responses
     $old_repl_compat,
     $pidfile,
+    $repl_use_get_port,
    );
 
 my $default_mindevcount;
@@ -96,6 +97,7 @@ sub load_config {
                              'no_schema_check' => \$cmdline{no_schema_check},
                              'old_repl_compat=i' => \$cmdline{old_repl_compat},
                              'plugins=s@'        => \$cmdline{plugins},
+                             'repl_use_get_port=i' => \$cmdline{repl_use_get_port},
                              );
 
     # warn of old/deprecated options
@@ -131,7 +133,7 @@ sub load_config {
     }
 
     # Fill in defaults for those values which were either loaded from config or
-    # specified on the command line. Command line takes precendence, then values in
+    # specified on the command line. Command line takes precedence, then values in
     # the config file, then the defaults.
     $daemonize      = choose_value( 'daemonize', 0 );
     $db_dsn         = choose_value( 'db_dsn', "DBI:mysql:mogilefs" );
@@ -157,6 +159,8 @@ sub load_config {
     $node_timeout   = choose_value( 'node_timeout', 2 );
 
     $old_repl_compat = choose_value( 'old_repl_compat', 1 );
+    choose_value( 'rebalance_ignore_missing', 0 );
+    $repl_use_get_port = choose_value( 'repl_use_get_port', 0 );
 
     choose_value( 'no_schema_check', 0 );
 
@@ -300,11 +304,25 @@ sub server_setting_is_writable {
             die "Doesn't match acceptable format.";
         };
     };
+    my $valid_netmask = sub {
+        my $n = Net::Netmask->new2($_[0]);
+        die "Doesn't match an acceptable netmask" unless $n;
+    };
+    my $valid_netmask_list = sub {
+        my @ns = split /[,\s]+/, $_[0];
+        foreach my $n (@ns) {
+            $valid_netmask->($n);
+        }
+    };
 
     # let slave settings go through unmodified, for now.
     if ($key =~ /^slave_/) { return $del_if_blank };
     if ($key eq "enable_rebalance") { return $bool };
     if ($key eq "memcache_servers") { return $any  };
+
+    # ReplicationPolicy::MultipleNetworks
+    if ($key eq 'network_zones') { return $any };
+    if ($key =~ /^zone_/) { return $valid_netmask_list };
 
     if ($key eq "rebalance_policy") { return sub {
         my $v = shift;

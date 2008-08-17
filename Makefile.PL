@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 #   Perl Makefile for Danga-Socket
-#   $Id: Makefile.PL 987 2007-05-09 22:13:56Z bradfitz $
+#   $Id: Makefile.PL 1087 2007-07-03 20:41:28Z bradfitz $
 #
 #   Invoke with 'perl Makefile.PL'
 #
@@ -23,8 +23,7 @@ WriteMakefile(
     EXE_FILES               => $exefiles,
     PREREQ_PM               => {
         'Danga::Socket'    => '1.56',
-        'Perlbal'          => '1.53',  # Future: make Perlbal optional, for running mogstored
-                                       # in only-monitor/usage-writeout mode.
+        'Perlbal'          => '1.53',
         'Sys::Syslog'      => 0,
         'Sys::Syscall'     => '0.22',
         'Getopt::Long'     => 0,

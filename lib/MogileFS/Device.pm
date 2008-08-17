@@ -349,6 +349,11 @@ my $dir_made_lastclean = 0;
 sub create_directory {
     my ($self, $uri) = @_;
     return 1 if $self->doesnt_know_mkcol;
+
+    # rfc2518 says we "should" use a trailing slash. Some servers
+    # (nginx) appears to require it.
+    $uri .= '/' unless $uri =~ m!/$!;
+
     return 1 if $dir_made{$uri};
 
     my $hostid = $self->hostid;
@@ -368,7 +373,7 @@ sub create_directory {
     # if they don't support this method, remember that
     if ($ans && $ans =~ m!HTTP/1\.[01] (400|405|501)!) {
         $self->{no_mkcol} = 1;
-        # TODO: move this into method on device, which propogates to parent
+        # TODO: move this into method on device, which propagates to parent
         # and also receive from parent.  so all query workers share this knowledge
         return 1;
     }

@@ -6,7 +6,7 @@ use Test::More;
 use FindBin qw($Bin);
 use IO::Socket::INET;
 
-require 't/lib/mogtestlib.pl';
+use MogileFS::Test;
 
 unless ((`netstat -nap --inet` || "") =~ m!PID/Program!) {
     plan skip_all => "netstat output not how expected; skipping test.\n";
@@ -65,7 +65,7 @@ ok(!$alive, "gone");
 # dies when not able to find
 sub exist_pid {
     unless (`netstat -nap --inet` =~ m!127\.0\.1\.1:750[10].+LISTEN\s+(\d+)/!) {
-        die "Could't find pid of daemonized process.\n";
+        die "Couldn't find pid of daemonized process.\n";
     }
     return $1;
 }

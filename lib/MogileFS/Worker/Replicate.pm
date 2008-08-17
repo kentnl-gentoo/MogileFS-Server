@@ -249,14 +249,14 @@ sub replicate_using_devcounts {
     my $sto = Mgd::get_store();
     return 0 unless $sto->isa("MogileFS::Store::MySQL");
 
-    # call this $mdbh to indiciate it's a MySQL dbh, and to help grepping
+    # call this $mdbh to indicate it's a MySQL dbh, and to help grepping
     # for old handles.  :)
     my $mdbh = $sto->dbh;
 
     my $did_something = 0;
     MogileFS::Class->foreach(sub {
         my $mclass = shift;
-        my ($dmid, $classid, $min, $policy_class) = map { $mclass->$_ } qw(domainid classid mindevcount policy_class);
+        my ($dmid, $classid, $min) = map { $mclass->$_ } qw(domainid classid mindevcount);
 
         debug("Checking replication for dmid=$dmid, classid=$classid, min=$min") if $Mgd::DEBUG >= 2;
 
@@ -400,7 +400,7 @@ sub rebalance_devfid {
     # bail out early if this FID is no longer in the namespace (weird
     # case where file is in file_on because not yet deleted, but
     # has been replaced/deleted in 'file' table...).  not too harmful
-    # (just nosiy) if thise line didn't exist, but whatever... it
+    # (just noisy) if this line didn't exist, but whatever... it
     # makes stuff cleaner on my intentionally-corrupted-for-fsck-testing
     # dev machine...
     return 1 if ! $fid->exists;
@@ -433,7 +433,7 @@ sub rebalance_devfid {
         # lost the race because the replication policy said there's
         # nothing to do, even with this devfid masked away.
         # so let's figure it out... if this devfid still exists,
-        # we're overreplicated, else we just lost the race.
+        # we're over-replicated, else we just lost the race.
         if ($devfid->exists) {
             # over-replicated
 
@@ -457,8 +457,13 @@ sub rebalance_devfid {
         $del_reason = "did_rebalance;ret=$ret";
     }
 
+    my %destroy_opts;
+
+    $destroy_opts{ignore_missing} = 1
+        if MogileFS::Config->config("rebalance_ignore_missing");
+
     if ($should_delete) {
-        eval { $devfid->destroy };
+        eval { $devfid->destroy(%destroy_opts) };
         if ($@) {
             return $fail->("HTTP delete (due to '$del_reason') failed: $@");
         }
@@ -547,11 +552,7 @@ sub replicate {
     return $retunlock->("nofid") unless $fid->exists;
 
     my $cls = $fid->class;
-    my $policy_class = $cls->policy_class;
-    eval "use $policy_class; 1;";
-    if ($@) {
-        return error("Failed to load policy class: $policy_class: $@");
-    }
+    my $polobj = $cls->repl_policy_obj;
 
     # learn what this devices file is already on
     my @on_devs;         # all devices fid is on, reachable or not.
@@ -585,17 +586,17 @@ sub replicate {
 
     my $rr;  # MogileFS::ReplicationRequest
     while (1) {
-        $rr = rr_upgrade($policy_class->replicate_to(
-                                                     fid       => $fidid,
-                                                     on_devs   => \@on_devs_tellpol, # all device objects fid is on, dead or otherwise
-                                                     all_devs  => $devs,
-                                                     failed    => \%dest_failed,
-                                                     min       => $cls->mindevcount,
-                                                     ));
+        $rr = rr_upgrade($polobj->replicate_to(
+                                               fid       => $fidid,
+                                               on_devs   => \@on_devs_tellpol, # all device objects fid is on, dead or otherwise
+                                               all_devs  => $devs,
+                                               failed    => \%dest_failed,
+                                               min       => $cls->mindevcount,
+                                               ));
 
         last if $rr->is_happy;
 
-        my @ddevs;  # dest devs, in order of preferrence
+        my @ddevs;  # dest devs, in order of preference
         my $ddevid; # dest devid we've chosen to copy to
         if (@ddevs = $rr->copy_to_one_of_ideally) {
             if (my @not_masked_ids = (grep { ! $mask_devids->{$_} &&
@@ -777,6 +778,9 @@ sub http_copy {
     my ($shost, $dhost) = (map { $_->host     } ($sdev, $ddev));
 
     my ($shostip, $sport) = ($shost->ip, $shost->http_port);
+    if (MogileFS::Config->config("repl_use_get_port")) {
+        $sport = $shost->http_get_port;
+    }
     my ($dhostip, $dport) = ($dhost->ip, $dhost->http_port);
     unless (defined $spath && defined $dpath && defined $shostip && defined $dhostip && $sport && $dport) {
         # show detailed information to find out what's not configured right

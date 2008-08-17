@@ -67,12 +67,13 @@ sub reload_classes {
 
     foreach my $row (Mgd::get_store()->get_all_classes) {
         my $cl =
-            ($singleton{$row->{dmid}}{$row->{classid}} ||=
+            ($singleton{$row->{dmid}}{$row->{classid}} =
              bless {
                  dmid        => $row->{dmid},
                  classid     => $row->{classid},
                  name        => $row->{classname},
                  mindevcount => $row->{mindevcount},
+                 replpolicy  => $row->{replpolicy}, 
              }, $pkg);
         $cl->{_loaded} = 1;
     }
@@ -82,7 +83,7 @@ sub reload_classes {
     foreach my $dom (MogileFS::Domain->domains) {
         my $dmid = $dom->id;
         my $cl =
-            ($singleton{$dmid}{0} ||=
+            ($singleton{$dmid}{0} =
              bless {
                  dmid        => $dmid,
                  classid     => 0,
@@ -166,7 +167,24 @@ sub create_class {
 sub domainid     { $_[0]{dmid} }
 sub classid      { $_[0]{classid} }
 sub mindevcount  { $_[0]{mindevcount} }
-sub policy_class { $_[0]{replpolicy} || "MogileFS::ReplicationPolicy::MultipleHosts" }
+
+sub repl_policy_string {
+    my $self = shift;
+    # if they've actually configured one, it gets used:
+    return $self->{replpolicy} if $self->{replpolicy};
+    # else, the historical default:
+    return "MultipleHosts()";
+}
+
+sub repl_policy_obj {
+    my $self = shift;
+    return $self->{_repl_policy_obj} if $self->{_repl_policy_obj};
+    my $polstr = $self->repl_policy_string;
+    # parses it:
+    my $pol = MogileFS::ReplicationPolicy->new_from_policy_string($polstr);
+    return $self->{_repl_policy_obj} = $pol;
+}
+
 sub name         { $_[0]{name} }
 
 sub domain {

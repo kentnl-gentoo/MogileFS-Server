@@ -2,7 +2,7 @@ package MogileFS::Server;
 use strict;
 use warnings;
 use vars qw($VERSION);
-$VERSION = "2.17";
+$VERSION = "2.18";
 
 =head1 NAME
 
@@ -14,6 +14,25 @@ MogileFS::Server - MogileFS (distributed filesystem) server
  $s->run;
 
 =cut
+
+# based on where we found this file (a pure-perl module),
+# add the mogdeps/ subdirectory of that base to our @INC search
+# path, where all the misc Mogile dependencies are installed.
+BEGIN {
+    my $libpath;
+    if (! $ENV{MOGILE_NO_BUILTIN_DEPS} &&
+        ($libpath = $INC{"MogileFS/Server.pm"}) &&
+        $libpath =~ s!MogileFS/Server.pm$!!)
+    {
+        my $dep_dir = "${libpath}mogdeps";
+        push @INC, $dep_dir;
+        unless (($ENV{PERL5LIB} || "") =~ /$dep_dir/) {
+            $ENV{PERL5LIB} = join(":",
+                                  split(/:/, $ENV{PERL5LIB} || ""),
+                                  $dep_dir);
+        }
+    }
+}
 
 use IO::Socket;
 use Symbol;

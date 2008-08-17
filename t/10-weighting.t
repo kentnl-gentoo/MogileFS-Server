@@ -11,10 +11,10 @@ use MogileFS::Server;
 BEGIN {
     $ENV{TESTING} = 1;
     $ENV{T_FAKE_IO_DEV1} = 95; # Simulating high device load (should get fewer requests).
-    $ENV{T_FAKE_IO_DEV2} = 5;  # Simulating low device load (shoudld get more requests).
+    $ENV{T_FAKE_IO_DEV2} = 5;  # Simulating low device load (should get more requests).
 }
 
-require 't/lib/mogtestlib.pl';
+use MogileFS::Test;
 find_mogclient_or_skip();
 
 # create temp mysql db,
@@ -99,7 +99,7 @@ ok(close($fh), "closed file");
 # wait for it to replicate
 my $tries = 1;
 my @urls;
-while ($tries++ < 30 && (@urls = $mogc->get_paths("file1")) < 2) {
+while ($tries++ < 40 && (@urls = $mogc->get_paths("file1")) < 2) {
     sleep .25;
 }
 is(scalar @urls, 2, "replicated to 2 paths");

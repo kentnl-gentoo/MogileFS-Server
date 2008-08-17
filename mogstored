@@ -12,6 +12,27 @@ eval 'exec /usr/bin/perl -w -S $0 ${1+"$@"}'
 
 use strict;
 use lib 'lib';
+use Mogstored::HTTPServer;
+
+# based on where we found Mogstored::HTTPServer (a pure-perl module),
+# add the mogdeps/ subdirectory of that base to our @INC search
+# path, where all the misc Mogile dependencies are installed.
+BEGIN {
+    my $libpath;
+    if (! $ENV{MOGILE_NO_BUILTIN_DEPS} &&
+        ($libpath = $INC{"Mogstored/HTTPServer.pm"}) &&
+        $libpath =~ s!Mogstored/HTTPServer.pm$!!)
+    {
+        my $dep_dir = "${libpath}mogdeps";
+        push @INC, $dep_dir;
+        unless (($ENV{PERL5LIB} || "") =~ /$dep_dir/) {
+            $ENV{PERL5LIB} = join(":",
+                                  split(/:/, $ENV{PERL5LIB} || ""),
+                                  $dep_dir);
+        }
+    }
+}
+
 use IO::Socket::INET;
 use POSIX qw(WNOHANG);
 use Perlbal 1.53;
@@ -19,9 +40,9 @@ use FindBin qw($Bin $RealScript);
 use Gearman::Server 1.08;
 use Gearman::Client::Async 0.93;
 
-use Mogstored::HTTPServer;
 use Mogstored::HTTPServer::Perlbal;
 use Mogstored::HTTPServer::Lighttpd;
+use Mogstored::HTTPServer::None;
 use Mogstored::HTTPServer::Apache;
 use Mogstored::SideChannelListener;
 use Mogstored::SideChannelClient;
@@ -64,8 +85,8 @@ my %config_opts = (
                    );
 usage() unless Getopt::Long::GetOptions(%config_opts);
 
-die "Unknown server type.  Valid options: --server={perlbal,lighttpd,apache}"
-    unless $server =~ /^perlbal|lighttpd|apache$/;
+die "Unknown server type.  Valid options: --server={perlbal,lighttpd,apache,none}"
+    unless $server =~ /^perlbal|lighttpd|apache|none$/;
 
 $opt_config = $default_config if ! $opt_config && -e $default_config;
 load_config_file($opt_config => \%config_opts) if $opt_config;
@@ -147,7 +168,7 @@ sub load_config_file {
     my ($conffile, $opts) = @_;
 
     # parse the mogstored config file, which is just lines of comments and
-    # "key = value" lines, where keys are just the same as commandline
+    # "key = value" lines, where keys are just the same as command line
     # options.
     die "Config file $opt_config doesn't exist.\n" unless -e $conffile;
     open my $fh, $conffile or die "Couldn't open config file for reading: $!";
@@ -192,7 +213,7 @@ sub start_fidsizes_worker {
         $class->exec;
     });
 
-    # old Gearman::Servers didn't return pid integegers
+    # old Gearman::Servers didn't return pid integers
     if ($pid =~ /^\d+$/) {
         Mogstored->on_pid_death($pid, \&start_fidsizes_worker);
     }

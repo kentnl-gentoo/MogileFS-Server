@@ -64,9 +64,9 @@ sub reload_domains {
         $id2name{$v} = $k;
     }
 
-    foreach my $dmid (keys %singleton) {
-        delete $singleton{$dmid} unless $id2name{$dmid};
-    }
+    # Blow singleton cache on reload. Otherwise a *change* in data may not be
+    # reflected.
+    %singleton = ();
 
     $last_load = $now;
 }
@@ -74,7 +74,7 @@ sub reload_domains {
 # FIXME: should probably have an invalidate_cache variant that only
 # flushes locally (for things like "get_domains" or "get_hosts", where
 # it needs to be locally correct for the semantics of the command, but
-# no need to propogate a cache invalidation to our peers)
+# no need to propagate a cache invalidation to our peers)
 sub invalidate_cache {
     $last_load = 0;
     %id2name = ();

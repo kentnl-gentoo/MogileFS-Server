@@ -11,13 +11,13 @@ use base 'MogileFS::Store';
 # --------------------------------------------------------------------------
 
 sub dsn_of_dbhost {
-    my ($class, $dbname, $host) = @_;
-    return "DBI:mysql:$dbname;host=$host";
+    my ($class, $dbname, $host, $port) = @_;
+    return "DBI:mysql:$dbname;host=$host" . ($port ? ";port=$port" : "");
 }
 
 sub dsn_of_root {
-    my ($class, $dbname, $host) = @_;
-    return "DBI:mysql:mysql";
+    my ($class, $dbname, $host, $port) = @_;
+    return $class->dsn_of_dbhost('mysql', $host, $port);
 }
 
 # --------------------------------------------------------------------------
@@ -116,6 +116,15 @@ sub release_lock {
     my $rv = $self->dbh->selectrow_array("SELECT RELEASE_LOCK(?)", undef, $lockname);
     $self->{lock_depth} = 0;
     return $rv;
+}
+
+# clears everything from the fsck_log table
+# return 1 on success.  die otherwise.
+# Under MySQL 4.1+ this is actually fast.
+sub clear_fsck_log {
+    my $self = shift;
+    $self->dbh->do("TRUNCATE TABLE fsck_log");
+    return 1;
 }
 
 # --------------------------------------------------------------------------

@@ -11,7 +11,8 @@ use List::Util ();
 #
 # 8: adds fsck_log table
 # 9: adds 'drain' state to enum in device table
-use constant SCHEMA_VERSION => 9;
+# 10: adds 'replpolicy' column to 'class' table
+use constant SCHEMA_VERSION => 10;
 
 sub new {
     my ($class) = @_;
@@ -56,8 +57,8 @@ sub want_raise_errors {
 
 sub new_from_mogdbsetup {
     my ($class, %args) = @_;
-    # where args is:  dbhost dbname dbrootuser dbrootpass dbuser dbpass
-    my $dsn = $class->dsn_of_dbhost($args{dbname}, $args{dbhost});
+    # where args is:  dbhost dbport dbname dbrootuser dbrootpass dbuser dbpass
+    my $dsn = $class->dsn_of_dbhost($args{dbname}, $args{dbhost}, $args{dbport});
 
     my $try_make_sto = sub {
         my $dbh = DBI->connect($dsn, $args{dbuser}, $args{dbpass}, {
@@ -74,14 +75,14 @@ sub new_from_mogdbsetup {
 
     # otherwise, we need to make the requested database, setup permissions, etc
     $class->status("couldn't connect to database as mogilefs user.  trying root...");
-    my $rootdsn = $class->dsn_of_root($args{dbname}, $args{dbhost});
+    my $rootdsn = $class->dsn_of_root($args{dbname}, $args{dbhost}, $args{dbport});
     my $rdbh = DBI->connect($rootdsn, $args{dbrootuser}, $args{dbrootpass}, {
         PrintError => 0,
     }) or
-        die "Failed to connect to $dsn as specified root user: " . DBI->errstr . "\n";
+        die "Failed to connect to $rootdsn as specified root user ($args{dbrootuser}): " . DBI->errstr . "\n";
     $class->status("connected to database as root user.");
 
-    $class->confirm("Create database name '$args{dbname}'?");
+    $class->confirm("Create/Upgrade database name '$args{dbname}'?");
     $class->create_db_if_not_exists($rdbh, $args{dbname});
     $class->confirm("Grant all privileges to user '$args{dbuser}', connecting from anywhere, to the mogilefs database '$args{dbname}'?");
     $class->grant_privileges($rdbh, $args{dbname}, $args{dbuser}, $args{dbpass});
@@ -327,7 +328,7 @@ sub insert_ignore {
         if ($@ || $dbh->err) {
             return 1 if $self->was_duplicate_error;
             # This chunk is identical to condthrow, but we include it directly
-            # here as we know there is definetly an error, and we would like
+            # here as we know there is definitely an error, and we would like
             # the caller of this function.
             my ($pkg, $fn, $line) = caller;
             my $msg = "Database error from $pkg/$fn/$line: " . $dbh->errstr;
@@ -384,8 +385,15 @@ sub setup_database {
     $sto->upgrade_add_device_weight;
     $sto->upgrade_add_device_readonly;
     $sto->upgrade_add_device_drain;
+    $sto->upgrade_add_class_replpolicy;
 
     return 1;
+}
+
+sub cached_schema_version {
+    my $self = shift;
+    return $self->{_cached_schema_version} ||=
+        $self->schema_version;
 }
 
 sub schema_version {
@@ -587,7 +595,7 @@ sub TABLE_file_to_replicate {
     # nexttry is time to try to replicate it next.
     #   0 means immediate.  it's only on one host.
     #   1 means lower priority.  it's on 2+ but isn't happy where it's at.
-    #   unixtimestamp means at/after that time.  some previous error occurred.
+    #   unix timestamp means at/after that time.  some previous error occurred.
     # fromdevid, if not null, means which devid we should replicate from.  perhaps it's the only non-corrupt one.  otherwise, wherever.
     # failcount.  how many times we've failed, just for doing backoff of nexttry.
     # flags.  reserved for future use.
@@ -631,6 +639,13 @@ sub upgrade_add_device_asof { 1 }
 sub upgrade_add_device_weight { 1 }
 sub upgrade_add_device_readonly { 1 }
 sub upgrade_add_device_drain { die "Not implemented in $_[0]" }
+
+sub upgrade_add_class_replpolicy {
+    my ($self) = @_;
+    unless ($self->column_type("class", "replpolicy")) {
+        $self->dowell("ALTER TABLE class ADD COLUMN replpolicy VARCHAR(255)");
+    }
+}
 
 # return true if deleted, 0 if didn't exist, exception if error
 sub delete_host {
@@ -987,7 +1002,7 @@ sub rename_file {
                  undef, $to_key, $fidid);
     };
     if ($@ || $dbh->err) {
-        # first is mysql's error code for duplicates
+        # first is MySQL's error code for duplicates
         if ($self->was_duplicate_error) {
             return 0;
         } else {
@@ -1009,7 +1024,13 @@ sub get_all_domains {
 sub get_all_classes {
     my ($self) = @_;
     my (@ret, $row);
-    my $sth = $self->dbh->prepare("SELECT dmid, classid, classname, mindevcount FROM class");
+
+    my $repl_col = "";
+    if ($self->cached_schema_version >= 10) {
+        $repl_col = ", replpolicy";
+    }
+
+    my $sth = $self->dbh->prepare("SELECT dmid, classid, classname, mindevcount $repl_col FROM class");
     $sth->execute;
     push @ret, $row while $row = $sth->fetchrow_hashref;
     return @ret;
@@ -1454,7 +1475,7 @@ sub random_fids_on_device {
     my $dbh = $self->dbh;
 
     # FIXME: this blows. not random.  and good chances these will
-    # eventually get to point where they're un-rebalanacable, and we
+    # eventually get to point where they're un-rebalance-able, and we
     # never move on past the first 5000
     my @some_fids = List::Util::shuffle(@{
         $dbh->selectcol_arrayref("SELECT fid FROM file_on WHERE devid=? LIMIT 5000",

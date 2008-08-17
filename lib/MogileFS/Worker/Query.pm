@@ -156,10 +156,12 @@ sub check_domain {
     my MogileFS::Worker::Query $self = shift;
     my $args = shift;
 
-    return $self->err_line("no_domain") unless length($args->{domain});
+    my $domain = $args->{domain};
+
+    return $self->err_line("no_domain") unless defined $domain && length $domain;
 
     # validate domain
-    my $dmid = MogileFS::Domain->id_of_name($args->{domain}) or
+    my $dmid = MogileFS::Domain->id_of_name($domain) or
         return $self->err_line("unreg_domain");
 
     return $dmid;
@@ -239,19 +241,24 @@ sub cmd_create_open {
     $profstart->("wait_monitor");
     $self->wait_for_monitor;
 
-    # find suitable device(s) to put this file on.
-    my @dests; # MogileFS::Device objects which are suitabke
-
     $profstart->("find_deviceid");
+
+    my @devices;
+
+    unless (MogileFS::run_global_hook('cmd_create_open_order_devices', [MogileFS::Device->devices], \@devices)) {
+        @devices = sort_devs_by_freespace(MogileFS::Device->devices);
+    }
+
+    # find suitable device(s) to put this file on.
+    my @dests; # MogileFS::Device objects which are suitable
+
     while (scalar(@dests) < ($multi ? 3 : 1)) {
-        my $ddev = first {
-            $_->should_get_new_files &&
-            $_->not_on_hosts(map { $_->host } @dests)
-        } weighted_list map {
-            [$_, 100 * $_->percent_free]
-        } MogileFS::Device->devices;
+        my $ddev = shift @devices;
 
         last unless $ddev;
+        next unless $ddev->should_get_new_files;
+        next unless $ddev->not_on_hosts(map { $_->host } @dests);
+
         push @dests, $ddev;
     }
     return $self->err_line("no_devices") unless @dests;
@@ -315,6 +322,21 @@ sub cmd_create_open {
     return $self->ok_line($res);
 }
 
+sub sort_devs_by_freespace {
+    my @devices_with_weights;
+
+    foreach my $dev (@_) {
+        next unless $dev->exists;
+
+        my $weight = 100 * $dev->percent_free;
+        push @devices_with_weights, [$dev, $weight];
+    }
+
+    my @list = MogileFS::Util::weighted_list(@devices_with_weights);
+
+    return @list;
+}
+
 sub cmd_create_close {
     my MogileFS::Worker::Query $self = shift;
     my $args = shift;
@@ -349,6 +371,7 @@ sub cmd_create_close {
     # if a temp file is closed without a provided-key, that means to
     # delete it.
     unless (defined $key && length($key)) {
+        $dfid->add_to_db;
         $fid->delete;
         return $self->ok_line;
     }
@@ -715,7 +738,7 @@ sub cmd_create_host {
 
     my $host = MogileFS::Host->of_hostname($hostname);
 
-    # if we're createing a new host, require ip/port, and default to
+    # if we're creating a new host, require ip/port, and default to
     # host being down if client didn't specify
     if ($args->{update}) {
         return $self->err_line('host_not_found') unless $host;
@@ -857,8 +880,6 @@ sub cmd_get_paths {
         paths => 0,
     };
 
-    my @devices_with_weights;
-
     # find devids that FID is on in memcache or db.
     my @fid_devids;
     my $need_devids_in_memcache = 0;
@@ -877,31 +898,18 @@ sub cmd_get_paths {
         $memc->add($devid_memkey, \@fid_devids, 3600) if $need_devids_in_memcache;
     }
 
-    # is this fid still owned by this key?
-    foreach my $devid (@fid_devids) {
-        my $weight;
-        my $dev = $dmap->{$devid};
-        my $util = $dev->observed_utilization;
+    my @devices = map { $dmap->{$_} } @fid_devids;
 
-        if (defined($util) and $util =~ /\A\d+\Z/) {
-            $weight = 102 - $util;
-            $weight ||= 100;
-        } else {
-            $weight = $dev->weight;
-            $weight ||= 100;
-        }
-        push @devices_with_weights, [$devid, $weight];
+    my @sorted_devs;
+    unless (MogileFS::run_global_hook('cmd_get_paths_order_devices', \@devices, \@sorted_devs)) {
+        @sorted_devs = sort_devs_by_utilization(@devices);
     }
-
-    # randomly weight the devices
-    my @list = MogileFS::Util::weighted_list(@devices_with_weights);
 
     # keep one partially-bogus path around just in case we have nothing else to send.
     my $backup_path;
 
     # construct result paths
-    foreach my $devid (@list) {
-        my $dev = $dmap->{$devid};
+    foreach my $dev (@sorted_devs) {
         next unless $dev && ($dev->can_read_from);
 
         my $host = $dev->host;
@@ -933,6 +941,185 @@ sub cmd_get_paths {
         $ret->{path1} = $backup_path;
     }
 
+    return $self->ok_line($ret);
+}
+
+sub sort_devs_by_utilization {
+    my @devices_with_weights;
+
+    # is this fid still owned by this key?
+    foreach my $dev (@_) {
+        my $weight;
+        my $util = $dev->observed_utilization;
+
+        if (defined($util) and $util =~ /\A\d+\Z/) {
+            $weight = 102 - $util;
+            $weight ||= 100;
+        } else {
+            $weight = $dev->weight;
+            $weight ||= 100;
+        }
+        push @devices_with_weights, [$dev, $weight];
+    }
+
+    # randomly weight the devices
+    my @list = MogileFS::Util::weighted_list(@devices_with_weights);
+
+    return @list;
+}
+
+# ------------------------------------------------------------
+#
+# NOTE: cmd_edit_file is EXPERIMENTAL. Please see the documentation
+# for edit_file in L<MogileFS::Client>.
+# It is not recommended to use cmd_edit_file on production systems.
+#
+# cmd_edit_file is similar to cmd_get_paths, except we:
+# - take the device of the first path we would have returned
+# - get a tempfile with a new fid (pointing to nothing) on the same device
+#   the tempfile has the same key, so will replace the old contents on
+#   create_close
+# - detach the old fid from that device (leaving the file in place)
+# - attach the new fid to that device
+# - returns only the first path to the old fid and a path to new fid
+# (the client then DAV-renames the old path to the new path)
+#
+# TODO - what to do about situations where we would be reducing the
+# replica count to zero?
+# TODO - what to do about pending replications where we remove the source?
+# TODO - the current implementation of cmd_edit_file is based on a copy
+#   of cmd_get_paths. Once proven mature, consider factoring out common
+#   code from the two functions.
+# ------------------------------------------------------------
+sub cmd_edit_file {
+    my MogileFS::Worker::Query $self = shift;
+    my $args = shift;
+
+    my $memc = MogileFS::Config->memcache_client;
+
+    # validate domain for plugins
+    $args->{dmid} = $self->check_domain($args)
+        or return $self->err_line('domain_not_found');
+
+    # now invoke the plugin, abort if it tells us to
+    my $rv = MogileFS::run_global_hook('cmd_get_paths', $args);
+    return $self->err_line('plugin_aborted')
+        if defined $rv && ! $rv;
+
+    # validate parameters
+    my $dmid = $args->{dmid};
+    my $key = $args->{key} or return $self->err_line("no_key");
+
+    # get DB handle
+    my $fid;
+    my $need_fid_in_memcache = 0;
+    my $mogfid_memkey = "mogfid:$args->{dmid}:$key";
+    if (my $fidid = $memc->get($mogfid_memkey)) {
+        $fid = MogileFS::FID->new($fidid);
+    } else {
+        $need_fid_in_memcache = 1;
+    }
+    unless ($fid) {
+        Mgd::get_store()->slaves_ok(sub {
+            $fid = MogileFS::FID->new_from_dmid_and_key($dmid, $key);
+        });
+        $fid or return $self->err_line("unknown_key");
+    }
+
+    # add to memcache, if needed.  for an hour.
+    $memc->add($mogfid_memkey, $fid->id, 3600) if $need_fid_in_memcache;
+
+    my $dmap = MogileFS::Device->map;
+
+    my @devices_with_weights;
+
+    # find devids that FID is on in memcache or db.
+    my @fid_devids;
+    my $need_devids_in_memcache = 0;
+    my $devid_memkey = "mogdevids:" . $fid->id;
+    if (my $list = $memc->get($devid_memkey)) {
+        @fid_devids = @$list;
+    } else {
+        $need_devids_in_memcache = 1;
+    }
+    unless (@fid_devids) {
+        Mgd::get_store()->slaves_ok(sub {
+            @fid_devids = $fid->devids;
+        });
+        $memc->add($devid_memkey, \@fid_devids, 3600) if $need_devids_in_memcache;
+    }
+
+    # is this fid still owned by this key?
+    foreach my $devid (@fid_devids) {
+        my $weight;
+        my $dev = $dmap->{$devid};
+        my $util = $dev->observed_utilization;
+
+        if (defined($util) and $util =~ /\A\d+\Z/) {
+            $weight = 102 - $util;
+            $weight ||= 100;
+        } else {
+            $weight = $dev->weight;
+            $weight ||= 100;
+        }
+        push @devices_with_weights, [$devid, $weight];
+    }
+
+    # randomly weight the devices
+    # TODO - should we reverse the order, to leave the best
+    # one there for get_paths?
+    my @list = MogileFS::Util::weighted_list(@devices_with_weights);
+
+    # Filter out bad devs
+    @list = grep {
+        my $devid = $_;
+        my $dev = $dmap->{$devid};
+        my $host = $dev ? $dev->host : undef;
+
+        $dev
+        && $host
+        && $dev->can_read_from
+        && !($host->observed_unreachable || $dev->observed_unreachable);
+    } @list;
+
+    # Take first remaining device from list
+    my $devid = $list[0];
+
+    my $class = MogileFS::Class->of_fid($fid);
+    my $newfid = eval {
+        Mgd::get_store()->register_tempfile(
+            fid     => undef,   # undef => let the store pick a fid
+            dmid    => $dmid,
+            key     => $key,    # This tempfile will ultimately become this key
+            classid => $class->classid,
+            devids  => $devid,
+        );
+    };
+    unless ($newfid) {
+        my $errc = error_code($@);
+        return $self->err_line("fid_in_use") if $errc eq "dup";
+        warn "Error registering tempfile: $@\n";
+        return $self->err_line("db");
+    }
+    unless (Mgd::get_store()->remove_fidid_from_devid($fid->id, $devid)) {
+        warn "Error removing fidid from devid";
+        return $self->err_line("db");
+    }
+    unless (Mgd::get_store()->add_fidid_to_devid($newfid, $devid)) {
+        warn "Error removing fidid from devid";
+        return $self->err_line("db");
+    }
+
+    my @paths = map {
+        my $dfid = MogileFS::DevFID->new($devid, $_);
+        my $path = $dfid->get_url;
+    } ($fid, $newfid);
+    my $ret;
+    $ret->{oldpath} = $paths[0];
+    $ret->{newpath} = $paths[1];
+    $ret->{fid} = $newfid;
+    $ret->{devid} = $devid;
+    $ret->{class} = $class->classid;
     return $self->ok_line($ret);
 }
 
@@ -975,7 +1162,7 @@ sub cmd_set_state {
     return $self->ok_line;
 }
 
-# FIXME: this whole thing is gross, duplicative, dependendent on $dbh, and doesn't scale.
+# FIXME: this whole thing is gross, duplicative, dependent on $dbh, and doesn't scale.
 # stats needs total overhaul to not suck.
 sub cmd_stats {
     my MogileFS::Worker::Query $self = shift;
@@ -1080,7 +1267,7 @@ sub cmd_stats {
         $ret->{"devicescount"} = $count;
     }
 
-    # now fid statitics
+    # now fid statistics
     if ($args->{fids} || $args->{all}) {
         my $max = $dbh->selectrow_array('SELECT MAX(fid) FROM file');
         $ret->{"fidmax"} = $max;
@@ -1217,7 +1404,10 @@ sub cmd_fsck_reset {
     my $args = shift;
 
     my $sto = Mgd::get_store();
-    $sto->set_server_setting("fsck_opt_policy_only", ($args->{policy_only} ? "1" : undef));
+    $sto->set_server_setting("fsck_opt_policy_only",
+        ($args->{policy_only} ? "1" : undef));
+    $sto->set_server_setting("fsck_highest_fid_checked", 
+        ($args->{startpos} ? $args->{startpos} : "0"));
 
     $self->_do_fsck_reset or return $self->err_line;
     return $self->ok_line;
@@ -1226,8 +1416,7 @@ sub cmd_fsck_reset {
 sub _do_fsck_reset {
     my MogileFS::Worker::Query $self = shift;
     my $sto = Mgd::get_store();
-    $sto->set_server_setting("fsck_highest_fid_checked", "0");
-    $sto->set_server_setting("fsck_start_time",       $sto->get_db_unixtime);
+    $sto->set_server_setting("fsck_start_time",       undef);
     $sto->set_server_setting("fsck_stop_time",        undef);
     $sto->set_server_setting("fsck_fids_checked",     0);
     $sto->set_server_setting("fsck_fid_at_end",       $sto->max_fidid);
@@ -1291,7 +1480,7 @@ sub cmd_fsck_status {
         $ret->{"num_$1"} += $ss->{$k};
     }
 
-    # add in any stats which might not've been summarized yet.,,
+    # add in any stats which might have not been summarized yet.,,
     my $max_logid = $sto->max_fsck_logid;
     my $min_logid = MogileFS::Util::max($intss->("fsck_start_maxlogid"),
                                         $max_logid - ($max_logid % $sto->fsck_log_summarize_every)) + 1;
@@ -1331,10 +1520,10 @@ sub err_line {
         'after_mismatch' => "Pattern does not match the after-value?",
         'bad_params' => "Invalid parameters to command; please see documentation",
         'class_exists' => "That class already exists in that domain",
-        'class_has_files' => "Class still has files, uanble to delete",
+        'class_has_files' => "Class still has files, unable to delete",
         'class_not_found' => "Class not found",
         'db' => "Database error",
-        'domain_has_files' => "Domain still has files, uanble to delete",
+        'domain_has_files' => "Domain still has files, unable to delete",
         'domain_exists' => "That domain already exists",
         'domain_not_empty' => "Domain still has classes, unable to delete",
         'domain_not_found' => "Domain not found",

@@ -4,6 +4,7 @@ use strict;
 use Digest::MD5 qw(md5); # Used for lockid
 use DBI;
 use DBD::Pg;
+use Sys::Hostname;
 use MogileFS::Util qw(throw debug error);
 use MogileFS::Server;
 use Carp;
@@ -14,13 +15,13 @@ use base 'MogileFS::Store';
 # --------------------------------------------------------------------------
 
 sub dsn_of_dbhost {
-    my ($class, $dbname, $host) = @_;
-    return "DBI:Pg:dbname=$dbname;host=$host";
+    my ($class, $dbname, $host, $port) = @_;
+    return "DBI:Pg:dbname=$dbname;host=$host" . ($port ? ";port=$port" : "");
 }
 
 sub dsn_of_root {
-    my ($class, $dbname, $host) = @_;
-    return "DBI:Pg:dbname=postgres;host=$host";
+    my ($class, $dbname, $host, $port) = @_;
+    return $class->dsn_of_dbhost('postgres', $host, $port);
 }
 
 # --------------------------------------------------------------------------
@@ -660,7 +661,6 @@ sub lockid {
 # (hostname,pid).
 # returns 1 on success and 0 on timeout
 sub get_lock {
-    use Sys::Hostname;
     my ($self, $lockname, $timeout) = @_;
     my $lockid = lockid($lockname);
     die "Lock recursion detected (grabbing $lockname ($lockid), had $self->{last_lock} (".lockid($self->{last_lock}).").  Bailing out." if $self->{lock_depth};
@@ -695,7 +695,7 @@ sub release_lock {
     my $lockid = lockid($lockname);
     debug("$$ Unlocking $lockname ($lockid)\n") if $Mgd::DEBUG >= 5;
     #my $rv = $self->dbh->selectrow_array("SELECT pg_advisory_unlock(?)", undef, $lockid);
-    my $rv = $self->dbh->do('DELETE FROM lock WHERE lockid=? AND pid=?', undef, $lockid, $$);
+    my $rv = $self->dbh->do('DELETE FROM lock WHERE lockid=? AND pid=? AND hostname=?', undef, $lockid, $$, hostname);
     debug("Double-release of lock $lockname!") if $self->{lock_depth} != 0 and $rv == 0 and $Mgd::DEBUG >= 2;
     $self->condthrow;
     $self->{lock_depth} = 0;

@@ -6,7 +6,7 @@ use base 'MogileFS::Worker';
 use MogileFS::Util qw(error);
 
 # we select 1000 but only do a random 100 of them, to allow
-# for stateless paralleism
+# for stateless parallelism
 use constant LIMIT => 1000;
 use constant PER_BATCH => 100;
 
@@ -77,7 +77,7 @@ sub process_tempfiles {
 
     # BUT NOTE:
     #    the fids might exist on one of the devices in devids column if we assigned them those,
-    #    they wrote some to one of them, then they died or for wahtever reason didn't create_close
+    #    they wrote some to one of them, then they died or for whatever reason didn't create_close
     #    to use, so we shouldn't delete from tempfile before going on a hunt of the missing fid.
     #    perhaps we should just add to the file_on table for both devids, and let the regular delete
     #    process discover via 404 that they're not there.
@@ -98,7 +98,17 @@ sub process_tempfiles {
     # now expunged (or soon to be) rows from tempfile
     my (@devfids, @fidids);
     foreach my $row (@$tempfiles) {
-        push @fidids, $row->[0];
+
+        # If FID is still loadable, we've arrived here due to a bug or race
+        # condition elsewhere. Remove the tempfile row but don't delete the
+        # file!
+        my $fidid = $row->[0];
+        my $fid = MogileFS::FID->new($fidid);
+        if ($fid->exists) {
+            $sto->delete_tempfile_row($fidid);
+            next;
+        }
+        push @fidids, $fidid;
 
         # sanity check the string column.
         my $devids = $row->[1];
@@ -110,6 +120,9 @@ sub process_tempfiles {
             push @devfids, MogileFS::DevFID->new($devid, $row->[0]);
         }
     }
+
+    # We might've done no work due to discovering the tempfiles are real.
+    return 0 unless @fidids;
 
     $sto->mass_insert_file_on(@devfids);
     $sto->enqueue_fids_to_delete(@fidids);
