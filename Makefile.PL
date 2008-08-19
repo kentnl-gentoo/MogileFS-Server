@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
-#   Perl Makefile for Danga-Socket
-#   $Id: Makefile.PL 1087 2007-07-03 20:41:28Z bradfitz $
+#   Perl Makefile for MogileFS
+#   $Id: Makefile.PL 1217 2008-08-19 06:53:49Z dormando $
 #
 #   Invoke with 'perl Makefile.PL'
 #
@@ -34,5 +34,17 @@ WriteMakefile(
         'Gearman::Client' => 1.07,  # for Gearman::Worker, in fidsizes worker
         fields            => 0,
     },
+    EXTRA_META              => <<'EXTRA',
+no_index:
+    directory:
+        - mogdeps
+    package:
+        - ProcessHandle
+        - TrackerHandle
+        - MogstoredHandle
+        - MogPath
+        - Mgd
+        - MogPath
+EXTRA
 );
 
