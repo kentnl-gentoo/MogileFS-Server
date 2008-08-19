@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 #   Perl Makefile for MogileFS
-#   $Id: Makefile.PL 1217 2008-08-19 06:53:49Z dormando $
+#   $Id: Makefile.PL 1220 2008-08-19 07:02:59Z dormando $
 #
 #   Invoke with 'perl Makefile.PL'
 #
@@ -37,7 +37,7 @@ WriteMakefile(
     EXTRA_META              => <<'EXTRA',
 no_index:
     directory:
-        - mogdeps
+        - lib/mogdeps
     package:
         - ProcessHandle
         - TrackerHandle
