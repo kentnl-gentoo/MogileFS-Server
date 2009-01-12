@@ -6,10 +6,12 @@ use fields ('psock',              # socket for parent/child communications
             'monitor_has_run',    # true once we've heard of the monitor job being alive
             'last_ping',          # time we last said we're alive
             'woken_up',           # bool: if we've been woken up
-            'last_wake'           # hashref: { $class -> time() } when we last woke up a certain job class
+            'last_wake',          # hashref: { $class -> time() } when we last woke up a certain job class
+            'queue_depth',        # depth of a queue we queried
+            'queue_todo',         # aref of hrefs of work sent from parent
             );
 
-use MogileFS::Util qw(error);
+use MogileFS::Util qw(error eurl decode_url_args);
 use MogileFS::Server;
 
 use vars (
@@ -27,6 +29,8 @@ sub new {
     $self->{monitor_has_run}  = 0;
     $self->{last_ping}        = 0;
     $self->{last_wake}        = {};
+    $self->{queue_depth}      = {};
+    $self->{queue_todo}       = {};
 
     IO::Handle::blocking($psock, 0);
     return $self;
@@ -123,11 +127,13 @@ sub process_line {
 }
 
 sub read_from_parent {
-    my $self = shift;
+    my $self    = shift;
+    my $timeout = shift || 0;
     my $psock = $self->{psock};
 
     # while things are immediately available,
-    while (MogileFS::Util::wait_for_readability(fileno($psock), 0)) {
+    # (or optionally sleep a bit)
+    while (MogileFS::Util::wait_for_readability(fileno($psock), $timeout)) {
         my $buf;
         my $rv = sysread($psock, $buf, 1024);
         if (!$rv) {
@@ -284,9 +290,38 @@ sub process_generic_command {
         return 1;
     }
 
+    # queue_name depth
+    if ($$lineref =~ /^:queue_depth (\w+) (\d+)/) {
+        $self->queue_depth($1, $2);
+        return 1;
+    }
+
+    # queue_name encoded_item
+    if ($$lineref =~ /^:queue_todo (\w+) (.+)/) {
+        # TODO: Use the accessor.
+        push(@{$self->{queue_todo}->{$1}}, decode_url_args(\$2));
+        return 1;
+    }
+
     # TODO: warn on unknown commands?
 
     return 0;
+}
+
+sub queue_depth {
+    my MogileFS::Worker $self = shift;
+    my $type = shift;
+    $self->{queue_depth}->{$type} ||= 0;
+    return $self->{queue_depth}->{$type} unless @_;
+    return $self->{queue_depth}->{$type} = shift;
+}
+
+sub queue_todo {
+    my MogileFS::Worker $self = shift;
+    my $type = shift;
+    $self->{queue_todo}->{$type} ||= [];
+    push(@{$self->{queue_todo}->{$type}}, @_) if @_;
+    return $self->{queue_todo}->{$type};
 }
 
 sub was_woken_up {

@@ -65,6 +65,8 @@ our (
     $old_repl_compat,
     $pidfile,
     $repl_use_get_port,
+    $local_network,
+    $no_unreachable_tracking,
    );
 
 my $default_mindevcount;
@@ -98,6 +100,8 @@ sub load_config {
                              'old_repl_compat=i' => \$cmdline{old_repl_compat},
                              'plugins=s@'        => \$cmdline{plugins},
                              'repl_use_get_port=i' => \$cmdline{repl_use_get_port},
+                             'local_network=s' => \$cmdline{local_network},
+                             'no_unreachable_tracking' => \$cmdline{no_unreachable_tracking},
                              );
 
     # warn of old/deprecated options
@@ -158,9 +162,11 @@ sub load_config {
     choose_value( 'default_mindevcount', 2 );
     $node_timeout   = choose_value( 'node_timeout', 2 );
 
-    $old_repl_compat = choose_value( 'old_repl_compat', 1 );
+    $old_repl_compat = choose_value( 'old_repl_compat', 0 );
     choose_value( 'rebalance_ignore_missing', 0 );
     $repl_use_get_port = choose_value( 'repl_use_get_port', 0 );
+    $local_network  = choose_value( 'local_network', '' );
+    $no_unreachable_tracking = choose_value( 'no_unreachable_tracking', 1 );
 
     choose_value( 'no_schema_check', 0 );
 
@@ -251,6 +257,10 @@ sub server_setting {
     return Mgd::get_store()->server_setting($key);
 }
 
+sub server_setting_cached {
+    my ($class, $key, $timeout) = @_;
+    return Mgd::get_store()->server_setting_cached($key, $timeout);
+}
 
 my $memc;
 my $last_memc_server_fetch = 0;
@@ -313,6 +323,7 @@ sub server_setting_is_writable {
         foreach my $n (@ns) {
             $valid_netmask->($n);
         }
+        return $_[0];
     };
 
     # let slave settings go through unmodified, for now.
@@ -332,6 +343,9 @@ sub server_setting_is_writable {
             $v =~ /^[\w:\-]+$/;
         return $v;
     }}
+
+    # should probably restrict to (\d+)
+    if ($key =~ /^queue_/) { return $any };
 
     return 0;
 }

@@ -26,6 +26,9 @@ sub server_starttime { return $starttime }
 my @IdleQueryWorkers;  # workers that are idle, able to process commands  (MogileFS::Worker::Query, ...)
 my @PendingQueries;    # [ MogileFS::Connection::Client, "$ip $query" ]
 
+my %idle_workers = (); # 'job' -> {href of idle workers}
+my %pending_work = (); # 'job' -> [aref of pending work]
+
 $IsChild = 0;  # either false if we're the parent, or a MogileFS::Worker object
 
 # keep track of what all child pids are doing, and what jobs are being
@@ -96,6 +99,7 @@ sub job_to_class_suffix {
         replicate   => "Replicate",
         reaper      => "Reaper",
         monitor     => "Monitor",
+        job_master  => "JobMaster",
     }->{$job};
 }
 
@@ -114,6 +118,11 @@ sub WatchDog {
         my MogileFS::Connection::Worker $child = $child{$pid};
         my $healthy = $child->watchdog_check;
         next if $healthy;
+
+        # special $todie level of 2 means the watchdog tried to kill it.
+        # TODO: Should be a CONSTANT?
+        next if $todie{$pid} && $todie{$pid} == 2;
+        note_pending_death($child->job, $pid, 2);
 
         error("Watchdog killing worker $pid (" . $child->job . ")");
         kill 9, $pid;
@@ -134,30 +143,33 @@ sub PostEventLoopChecker {
         MogileFS::ProcManager->WatchDog;
 
         # see if anybody has died, but don't hang up on doing so
-        my $pid = waitpid -1, WNOHANG;
-        return 1 if $pid <= 0 && $allkidsup;
-        $allkidsup = 0; # know something died
+        while(my $pid = waitpid -1, WNOHANG) {
+            last unless $pid > 0;
+            $allkidsup = 0; # know something died
 
-        # when a child dies, figure out what it was doing
-        # and note that job has one less worker
-        my $jobconn;
-        if ($pid > -1 && ($jobconn = delete $child{$pid})) {
-            my $job = $jobconn->job;
-            my $extra = $todie{$pid} ? "expected" : "UNEXPECTED";
-            error("Child $pid ($job) died: $? ($extra)");
-            MogileFS::ProcManager->NoteDeadChild($pid);
-            $jobconn->close;
+            # when a child dies, figure out what it was doing
+            # and note that job has one less worker
+            my $jobconn;
+            if (($jobconn = delete $child{$pid})) {
+                my $job = $jobconn->job;
+                my $extra = $todie{$pid} ? "expected" : "UNEXPECTED";
+                error("Child $pid ($job) died: $? ($extra)");
+                MogileFS::ProcManager->NoteDeadChild($pid);
+                $jobconn->close;
 
-            if (my $jobstat = $jobs{$job}) {
-                # if the pid is in %todie, then we have asked it to shut down
-                # and have already decremented the jobstat counter and don't
-                # want to do it again
-                unless (my $true = delete $todie{$pid}) {
-                    # decrement the count of currently running jobs
-                    $jobstat->[1]--;
+                if (my $jobstat = $jobs{$job}) {
+                    # if the pid is in %todie, then we have asked it to shut down
+                    # and have already decremented the jobstat counter and don't
+                    # want to do it again
+                    unless (my $true = delete $todie{$pid}) {
+                        # decrement the count of currently running jobs
+                        $jobstat->[1]--;
+                    }
                 }
             }
         }
+
+        return 1 if $allkidsup;
 
         # foreach job, fork enough children
         while (my ($job, $jobstat) = each %jobs) {
@@ -257,7 +269,11 @@ sub QueriesInProgressCount {
     return scalar keys %Mappings;
 }
 
+# Toss in any queue depths.
 sub StatsHash {
+    for my $job (keys %pending_work) {
+        $Stats{'work_queue_for_' . $job} = @{$pending_work{$job}};
+    }
     return \%Stats;
 }
 
@@ -290,6 +306,7 @@ sub valid_jobs {
 sub request_job_process {
     my ($class, $job, $n) = @_;
     return 0 unless $class->is_valid_job($job);
+    return 0 if $job eq 'job_master' && $n > 1; # ghetto special case
 
     $jobs{$job}->[0] = $n;
     $allkidsup = 0;
@@ -297,6 +314,9 @@ sub request_job_process {
     # try to clean out the queryworkers (if that's what we're doing?)
     MogileFS::ProcManager->CullQueryWorkers
         if $job eq 'queryworker';
+
+    # other workers listening off of a queue should be pinging parent
+    # frequently. shouldn't explicitly kill them.
 }
 
 
@@ -311,6 +331,8 @@ sub SetAsChild {
     %Mappings = ();
     $IsChild = $worker;
     %ErrorsTo = ();
+    %idle_workers = ();
+    %pending_work = ();
 
     # and now kill off our event loop so that we don't waste time
     Danga::Socket->SetPostLoopCallback(sub { return 0; });
@@ -475,6 +497,35 @@ sub HandleQueryWorkerResponse {
     MogileFS::ProcManager->NoteIdleQueryWorker($worker);
 }
 
+# new per-worker magic internal queue runner.
+# TODO: Since this fires only when a master asks or a worker reports
+# in bored, it should just operate on that *one* queue?
+#
+# new change: if worker in $job, but not in _bored, do not send work.
+# if work is received, only delete from _bored
+sub process_worker_queues {
+    return if $IsChild;
+
+    JOB: while (my ($job, $queue) = each %pending_work) {
+        next JOB unless @$queue;
+        next JOB unless $idle_workers{$job} && keys %{$idle_workers{$job}};
+        WORKER: for my $worker_key (keys %{$idle_workers{$job}}) {
+            my MogileFS::Connection::Worker $worker = 
+                delete $idle_workers{_bored}->{$worker_key};
+            if (!defined $worker || $worker->{closed}) {
+                delete $idle_workers{$job}->{$worker_key};
+                next WORKER;
+            }
+
+            # allow workers to grab a linear range of work.
+            while (@$queue && $worker->wants_todo($job)) {
+                $worker->write(":queue_todo $job " . shift(@$queue) . "\r\n");
+            }
+            next JOB unless @$queue;
+        }
+    }
+}
+
 # called from various spots to empty the queues of available pairs.
 sub ProcessQueues {
     return if $IsChild;
@@ -593,7 +644,44 @@ sub HandleChildRequest {
 
         # announce to the other replicators that this fid is starting to be replicated
         MogileFS::ProcManager->ImmediateSendToChildrenByJob('replicate', "repl_starting $fidid", $child);
-
+    } elsif ($cmd =~ /^queue_depth (\w+)/) {
+        my $job   = $1;
+        if ($job eq 'all') {
+            for my $qname (keys %pending_work) {
+                my $depth = @{$pending_work{$qname}};
+                $child->write(":queue_depth $qname $depth\r\n");
+            }
+        } else {
+            my $depth = 0;
+            if ($pending_work{$job}) {
+                $depth = @{$pending_work{$job}};
+            }
+            $child->write(":queue_depth $job $depth\r\n");
+        }
+        MogileFS::ProcManager->process_worker_queues;
+    } elsif ($cmd =~ /^queue_todo (\w+) (.+)/) {
+        my $job = $1;
+        $pending_work{$job} ||= [];
+        push(@{$pending_work{$job}}, $2);
+        # Don't process queues immediately, to allow batch processing.
+    } elsif ($cmd =~ /^worker_bored (\d+) (.+)/) {
+        my $batch = $1;
+        my $types = $2;
+        if (job_needs_reduction($child->job)) {
+            MogileFS::ProcManager->AskWorkerToDie($child);
+        } else {
+            unless (exists $idle_workers{$child->job}) {
+                $idle_workers{$child->job} = {};
+            }
+            $idle_workers{_bored} ||= {};
+            $idle_workers{_bored}->{$child} = $child;
+            for my $type (split(/\s+/, $types)) {
+                $idle_workers{$type} ||= {};
+                $idle_workers{$type}->{$child}++;
+                $child->wants_todo($type, $batch);
+            }
+            MogileFS::ProcManager->process_worker_queues;
+        }
     } elsif ($cmd eq ":ping") {
 
         # warn sprintf("Job '%s' with pid %d is still alive at %d\n", $child->job, $child->pid, time());
@@ -693,14 +781,17 @@ sub NoteDeadWorkerConn {
 }
 
 # given (job, pid), record that this worker is about to die
+# $level is so we can tell if watchdog requested the death.
 sub note_pending_death {
-    my ($job, $pid) = @_;
+    my ($job, $pid, $level) = @_;
 
     die "$job not defined in call to note_pending_death.\n"
         unless defined $jobs{$job};
 
-    $todie{$pid} = 1;
-    $jobs{$job}->[1]--;
+    $level ||= 1;
+    # don't double decrement.
+    $jobs{$job}->[1]-- unless $todie{$pid};
+    $todie{$pid} = $level;
 }
 
 # see if we should reduce the number of active children

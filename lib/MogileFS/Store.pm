@@ -12,7 +12,9 @@ use List::Util ();
 # 8: adds fsck_log table
 # 9: adds 'drain' state to enum in device table
 # 10: adds 'replpolicy' column to 'class' table
-use constant SCHEMA_VERSION => 10;
+# 11: adds 'file_to_queue' table
+# 12: adds 'file_to_delete2' table
+use constant SCHEMA_VERSION => 12;
 
 sub new {
     my ($class) = @_;
@@ -45,6 +47,7 @@ sub new_from_dsn_user_pass {
         slave_list_cache     => [],
         recheck_req_gen  => 0,  # incremented generation, of recheck of dbh being requested
         recheck_done_gen => 0,  # once recheck is done, copy of what the request generation was
+        server_setting_cache => {}, # value-agnostic db setting cache.
     }, $subclass;
     $self->init;
     return $self;
@@ -350,7 +353,8 @@ sub add_extra_tables {
 use constant TABLES => qw( domain class file tempfile file_to_delete
                             unreachable_fids file_on file_on_corrupt host
                             device server_settings file_to_replicate
-                            file_to_delete_later fsck_log);
+                            file_to_delete_later fsck_log file_to_queue
+                            file_to_delete2 );
 
 sub setup_database {
     my $sto = shift;
@@ -629,6 +633,34 @@ sub TABLE_fsck_log {
     )"
 }
 
+# generic queue table, designed to be used for workers/jobs which aren't
+# constantly in use, and are async to the user.
+# ie; fsck, drain, rebalance.
+sub TABLE_file_to_queue {
+    "CREATE TABLE file_to_queue (
+    fid       INT UNSIGNED NOT NULL,
+    devid     INT UNSIGNED,
+    type      TINYINT UNSIGNED NOT NULL,
+    nexttry   INT UNSIGNED NOT NULL,
+    failcount TINYINT UNSIGNED NOT NULL default '0',
+    flags     SMALLINT UNSIGNED NOT NULL default '0',
+    PRIMARY KEY (fid, type),
+    INDEX type_nexttry (type,nexttry)
+    )"
+}
+
+# new style async delete table.
+# this is separate from file_to_queue since deletes are more actively used,
+# and partitioning on 'type' doesn't always work so well.
+sub TABLE_file_to_delete2 {
+    "CREATE TABLE file_to_delete2 (
+    fid INT UNSIGNED NOT NULL PRIMARY KEY,
+    nexttry INT UNSIGNED NOT NULL,
+    failcount TINYINT UNSIGNED NOT NULL default '0',
+    INDEX nexttry (nexttry)
+    )"
+}
+
 # these five only necessary for MySQL, since no other database existed
 # before, so they can just create the tables correctly to begin with.
 # in the future, there might be new alters that non-MySQL databases
@@ -760,6 +792,21 @@ sub server_setting {
     my ($self, $key) = @_;
     return $self->dbh->selectrow_array("SELECT value FROM server_settings WHERE field=?",
                                        undef, $key);
+}
+
+# generic server setting cache.
+# note that you can call the same server setting with different timeouts, but
+# the timeout specified at the time of ... timeout, wins.
+sub server_setting_cached {
+    my ($self, $key, $timeout) = @_;
+    $self->{server_setting_cache}->{$key} ||= {val => '', refresh => 0};
+    my $cache = $self->{server_setting_cache}->{$key};
+    my $now = time();
+    if ($now > $cache->{refresh}) {
+        $cache->{val}     = $self->server_setting($key);
+        $cache->{refresh} = $now + $timeout;
+    }
+    return $cache->{val};
 }
 
 sub server_settings {
@@ -971,7 +1018,7 @@ sub delete_fidid {
     $self->condthrow;
     $self->dbh->do("DELETE FROM tempfile WHERE fid=?", undef, $fidid);
     $self->condthrow;
-    $self->dbh->do($self->ignore_replace . " INTO file_to_delete (fid) VALUES (?)", undef, $fidid);
+    $self->enqueue_for_delete2($fidid, 0);
     $self->condthrow;
 }
 
@@ -1115,6 +1162,54 @@ sub enqueue_for_replication {
                          "VALUES (?,?,$nexttry)", undef, $fidid, $from_devid);
 }
 
+# enqueue a fidid for delete
+# note: if we get one more "independent" queue like this, the
+# code should be collapsable? I tried once and it looked too ugly, so we have
+# some redundancy.
+sub enqueue_for_delete2 {
+    my ($self, $fidid, $in) = @_;
+
+    my $nexttry = 0;
+    if ($in) {
+        $nexttry = $self->unix_timestamp . " + " . int($in);
+    }
+
+    $self->insert_ignore("INTO file_to_delete2 (fid, nexttry) ".
+                         "VALUES (?,$nexttry)", undef, $fidid);
+}
+
+# enqueue a fidid for work
+sub enqueue_for_todo {
+    my ($self, $fidid, $type, $in) = @_;
+
+    my $nexttry = 0;
+    if ($in) {
+        $nexttry = $self->unix_timestamp . " + " . int($in);
+    }
+
+    $self->insert_ignore("INTO file_to_queue (fid, type, nexttry) ".
+                         "VALUES (?,?,$nexttry)", undef, $fidid, $type);
+}
+
+# return 1 on success.  die otherwise.
+sub enqueue_many_for_todo {
+    my ($self, $fidids, $type, $in) = @_;
+    if (@$fidids > 1 && ! ($self->can_insert_multi && ($self->can_replace || $self->can_insertignore))) {
+        $self->enqueue_for_todo($_->{fid}, $type, $in) foreach @$fidids;
+        return 1;
+    }
+    my $nexttry = 0;
+    if ($in) {
+        $nexttry = $self->unix_timestamp . " + " . int($in);
+    }
+
+    # TODO: convert to prepared statement?
+    $self->dbh->do($self->ignore_replace . " INTO file_to_queue (fid, type,
+    nexttry) VALUES " .
+                   join(",", map { "(" . int($_->{fid}) . ", $type, $nexttry)" } @$fidids))
+        or die "file_to_queue insert failed";
+}
+
 # reschedule all deferred replication, return number rescheduled
 sub replicate_now {
     my ($self) = @_;
@@ -1149,6 +1244,25 @@ sub get_fids_above_id {
     $sth->execute($fidid);
     while (my $row = $sth->fetchrow_hashref) {
         push @ret, MogileFS::FID->new_from_db_row($row);
+    }
+    return @ret;
+}
+
+# Same as above, but returns unblessed hashref.
+sub get_fid_hrefs_above_id {
+    my ($self, $fidid, $limit) = @_;
+    $limit ||= 1000;
+    $limit = int($limit);
+
+    my @ret;
+    my $dbh = $self->dbh;
+    my $sth = $dbh->prepare("SELECT fid, dmid, dkey, length, classid ".
+                            "FROM   file ".
+                            "WHERE  fid > ? ".
+                            "ORDER BY fid LIMIT $limit");
+    $sth->execute($fidid);
+    while (my $row = $sth->fetchrow_hashref) {
+        push @ret, $row;
     }
     return @ret;
 }
@@ -1212,6 +1326,75 @@ sub files_to_replicate {
     return values %$to_repl_map;
 }
 
+# "new" style queue consumption code.
+# from within a transaction, fetch a limit of fids,
+# then update each fid's nexttry to be off in the future,
+# giving local workers some time to dequeue the items.
+sub grab_files_to_replicate {
+    my ($self, $limit) = @_;
+    my $dbh = $self->dbh;
+    $dbh->begin_work;
+    my $ut = $self->unix_timestamp;
+    my $to_repl_map = $dbh->selectall_hashref(qq{
+        SELECT fid, fromdevid, failcount, flags, nexttry
+        FROM file_to_replicate
+        WHERE nexttry <= $ut
+        ORDER BY nexttry
+        LIMIT $limit
+        FOR UPDATE
+    }, 'fid');
+    unless (keys %$to_repl_map) { $dbh->commit; return (); }
+    my $fidlist = join(', ', keys %$to_repl_map);
+    $dbh->do(qq{UPDATE file_to_replicate SET nexttry = $ut + 1000
+        WHERE fid IN ($fidlist)});
+    $dbh->commit;
+    return values %$to_repl_map;
+}
+
+# Crap I wish this was less ugly to de-dupe. 
+sub grab_files_to_delete2 {
+    my ($self, $limit) = @_;
+    my $dbh = $self->dbh;
+    $dbh->begin_work;
+    my $ut = $self->unix_timestamp;
+    my $to_del_map = $dbh->selectall_hashref(qq{
+        SELECT *
+        FROM file_to_delete2
+        WHERE nexttry <= $ut
+        ORDER BY nexttry
+        LIMIT $limit
+        FOR UPDATE
+    }, 'fid');
+    unless (keys %$to_del_map) { $dbh->commit; return (); }
+    my $fidlist = join(', ', keys %$to_del_map);
+    $dbh->do(qq{UPDATE file_to_delete2 SET nexttry = $ut + 1000
+        WHERE fid IN ($fidlist)});
+    $dbh->commit;
+    return values %$to_del_map;
+}
+
+sub grab_files_to_queued {
+    my ($self, $type, $limit) = @_;
+    my $dbh = $self->dbh;
+    $dbh->begin_work;
+    my $ut = $self->unix_timestamp;
+    my $todo_map = $dbh->selectall_hashref(qq{
+        SELECT fid, type, failcount, flags, nexttry
+        FROM file_to_queue
+        WHERE type = $type
+        AND nexttry <= $ut
+        ORDER BY nexttry
+        LIMIT $limit
+        FOR UPDATE
+    }, 'fid');
+    unless (keys %$todo_map) { $dbh->commit; return (); }
+    my $fidlist = join(', ', keys %$todo_map);
+    $dbh->do(qq{UPDATE file_to_queue SET nexttry = $ut + 1000
+        WHERE fid IN ($fidlist)});
+    $dbh->commit;
+    return values %$todo_map;
+}
+
 # although it's safe to have multiple tracker hosts and/or processes
 # replicating the same file, around, it's inefficient CPU/time-wise,
 # and it's also possible they pick different places and waste disk.
@@ -1242,6 +1425,16 @@ sub delete_fid_from_file_to_replicate {
     $self->dbh->do("DELETE FROM file_to_replicate WHERE fid=?", undef, $fidid);
 }
 
+sub delete_fid_from_file_to_queue {
+    my ($self, $fidid) = @_;
+    $self->dbh->do("DELETE FROM file_to_queue WHERE fid=?", undef, $fidid);
+}
+
+sub delete_fid_from_file_to_delete2 {
+    my ($self, $fidid) = @_;
+    $self->dbh->do("DELETE FROM file_to_delete2 WHERE fid=?", undef, $fidid);
+}
+
 sub reschedule_file_to_replicate_absolute {
     my ($self, $fid, $abstime) = @_;
     $self->dbh->do("UPDATE file_to_replicate SET nexttry = ?, failcount = failcount + 1 WHERE fid = ?",
@@ -1251,6 +1444,19 @@ sub reschedule_file_to_replicate_absolute {
 sub reschedule_file_to_replicate_relative {
     my ($self, $fid, $in_n_secs) = @_;
     $self->dbh->do("UPDATE file_to_replicate SET nexttry = " . $self->unix_timestamp . " + ?, " .
+                   "failcount = failcount + 1 WHERE fid = ?",
+                   undef, $in_n_secs, $fid);
+}
+
+sub reschedule_file_to_delete2_absolute {
+    my ($self, $fid, $abstime) = @_;
+    $self->dbh->do("UPDATE file_to_delete2 SET nexttry = ?, failcount = failcount + 1 WHERE fid = ?",
+                   undef, $abstime, $fid);
+}
+
+sub reschedule_file_to_delete2_relative {
+    my ($self, $fid, $in_n_secs) = @_;
+    $self->dbh->do("UPDATE file_to_delete2 SET nexttry = " . $self->unix_timestamp . " + ?, " .
                    "failcount = failcount + 1 WHERE fid = ?",
                    undef, $in_n_secs, $fid);
 }

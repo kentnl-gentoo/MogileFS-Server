@@ -68,7 +68,7 @@ sub process_line {
 }
 
 # replicator wants
-sub watchdog_timeout { 30; }
+sub watchdog_timeout { 90; }
 
 sub work {
     my $self = shift;
@@ -77,8 +77,6 @@ sub work {
     my $warn_after = time() + 15;
 
     every(2.0, sub {
-        $self->parent_ping;
-
         # replication doesn't go well if the monitor job hasn't actively started
         # marking things as being available
         unless ($self->monitor_has_run) {
@@ -94,40 +92,38 @@ sub work {
         # FIXME: uh, what is this even used for nowadays?  it made more sense in mogilefs 1.x,
         # so maybe we kinda need it for compatibility?  but maybe we could ditch it here and
         # instead use the file_to_replicate table's row sat ENDOFTIME as meaning the same?
-        my $urfids = $dbh->selectall_arrayref('SELECT fid, lastupdate FROM unreachable_fids');
-        die $dbh->errstr if $dbh->err;
-        foreach my $r (@{$urfids || []}) {
-            my $nv = $r->[1] + 900;
-            unless ($fidfailure{$r->[0]} && $fidfailure{$r->[0]} < $nv) {
-                # given that we might have set it below to a time past the unreachable
-                # 15 minute timeout, we want to only overwrite %fidfailure's idea of
-                # the expiration time if we are extending it
-                $fidfailure{$r->[0]} = $nv;
+        unless (MogileFS::Config->config("no_unreachable_tracking")) {
+            my $urfids = $dbh->selectall_arrayref('SELECT fid, lastupdate FROM unreachable_fids');
+            die $dbh->errstr if $dbh->err;
+            foreach my $r (@{$urfids || []}) {
+                my $nv = $r->[1] + 900;
+                unless ($fidfailure{$r->[0]} && $fidfailure{$r->[0]} < $nv) {
+                    # given that we might have set it below to a time past the unreachable
+                    # 15 minute timeout, we want to only overwrite %fidfailure's idea of
+                    # the expiration time if we are extending it
+                    $fidfailure{$r->[0]} = $nv;
+                }
+                $unreachable{$r->[0]} = 1;
             }
-            $unreachable{$r->[0]} = 1;
         }
 
-        my $idle = 1;
-
+        $self->send_to_parent("worker_bored 100 replicate drain rebalance");
+        $self->read_from_parent(1);
         # this finds stuff to replicate based on its record in the needs_replication table
-        $idle = 0 if $self->replicate_using_torepl_table;
+        $self->replicate_using_torepl_table;
 
         # this finds stuff to replicate based on the devcounts.  (old style)
         if (MogileFS::Config->config("old_repl_compat")) {
-            $idle = 0 if $self->replicate_using_devcounts;
+            $self->replicate_using_devcounts;
         }
 
         # if replicators are otherwise idle, use them to make the world
         # better, rebalancing things (if enabled), and draining devices (if
         # any are marked drain)
-        if ($idle) {
-            $self->rebalance_devices;
-            $self->drain_devices;
-        }
+        $self->rebalance_devices;
+        $self->drain_devices;
     });
 }
-
-use constant REPLFETCH_LIMIT => 1000;
 
 # return 1 if we did something (or tried to do something), return 0 if
 # there was nothing to be done.
@@ -136,22 +132,17 @@ sub replicate_using_torepl_table {
 
     # find some fids to replicate, prioritize based on when they should be tried
     my $sto = Mgd::get_store();
-    my @to_repl = $sto->files_to_replicate(REPLFETCH_LIMIT)
-        or return 0;
+    my $queue_todo = $self->queue_todo('replicate');
+    unless (@$queue_todo) {
+        $self->parent_ping;
+        return 0;
+    }
 
-    # get random list of hashref of things to do:
-    @to_repl = List::Util::shuffle(@to_repl);
-
-    # sort our priority list in terms of 0s (immediate, only 1 copy), 1s (immediate replicate,
-    # but we already have 2 copies), and big numbers (unixtimestamps) of things that failed.
-    # but because sort is stable, these are random within their 0/1/big classes.
-    @to_repl = sort {
-        ($a->{nexttry} < 1000 || $b->{nexttry} < 1000) ? ($a->{nexttry} <=> $b->{nexttry}) : 0
-    } @to_repl;
-
-    foreach my $todo (@to_repl) {
+    while (my $todo = shift @$queue_todo) {
+        next unless $todo->{_type} eq 'replicate';
         my $fid = $todo->{fid};
         next if $self->peer_is_replicating($fid);
+        $self->still_alive;
 
         my $errcode;
 
@@ -314,6 +305,7 @@ sub replicate_using_devcounts {
                     # replicated this file), or 2 (success, but someone else replicated it).
                     # so if it's 2, we just want to go to the next fid.  this file is done.
                     next if $status eq "lost_race";
+                    next if $status eq "would_worsen";
 
                     # if it was no longer reachable, mark it reachable
                     if (delete $unreachable{$fid}) {
@@ -452,6 +444,12 @@ sub rebalance_devfid {
             # lost race
             $should_delete = 0;  # no-op
         }
+    } elsif ($ret eq "would_worsen") {
+        # replication has indicated we would be making ruining this fid's day
+        # if we delete an existing copy, so lets not do that.
+        # this indicates a condition where there're no suitable devices to
+        # copy new data onto, so lets be loud about it.
+        return $fail->("no suitable destination devices available");
     } else {
         $should_delete = 1;
         $del_reason = "did_rebalance;ret=$ret";
@@ -545,8 +543,6 @@ sub replicate {
     return $retunlock->(0, "failed_getting_lock", "Unable to obtain lock for fid $fidid")
         unless $sto->should_begin_replicating_fidid($fidid);
 
-    MogileFS::Worker->send_to_parent("repl_starting $fidid");
-
     # if the fid doesn't even exist, consider our job done!  no point
     # replicating file contents of a file no longer in the namespace.
     return $retunlock->("nofid") unless $fid->exists;
@@ -617,8 +613,12 @@ sub replicate {
                 # so instead, when masking is in effect, we don't
                 # use non-ideal placement, just bailing out.
 
-                # saying we lost a race is a bit of a lie.. but eh.
-                return $retunlock->("lost_race");
+                # this used to return "lost_race" as a lie, but rebalance was
+                # happily deleting the masked fid if at least one other fid
+                # existed... because it assumed it was over replicated.
+                # now we tell rebalance that touching this fid would be
+                # stupid.
+                return $retunlock->("would_worsen");
             }
         } elsif (@ddevs = $rr->copy_to_one_of_desperate) {
             # TODO: reschedule a replication for 'n' minutes in future, or
@@ -650,7 +650,9 @@ sub replicate {
             # TODO: use an observed good device+host as source to start.
             my @choices = grep { ! $source_failed{$_} } @on_up_devid;
             return $retunlock->(0, "source_down", "No devices available replicating $fidid") unless @choices;
-            $sdevid = @choices[int(rand(scalar @choices))];
+            @choices = List::Util::shuffle(@choices);
+            MogileFS::run_global_hook('replicate_order_final_choices', $devs, \@choices);
+            $sdevid = shift @choices;
         }
 
         my $worker = MogileFS::ProcManager->is_child or die;
@@ -658,6 +660,7 @@ sub replicate {
                            sdevid       => $sdevid,
                            ddevid       => $ddevid,
                            fid          => $fidid,
+                           rfid         => $fid,
                            expected_len => undef,  # FIXME: get this info to pass along
                            errref       => \$copy_err,
                            callback     => sub { $worker->still_alive; },
@@ -686,6 +689,7 @@ sub replicate {
 
         push @on_devs, $devs->{$ddevid};
         push @on_devs_tellpol, $devs->{$ddevid};
+        push @on_up_devid, $ddevid;
     }
 
     if ($rr->is_happy) {
@@ -728,10 +732,11 @@ sub peer_is_replicating {
 # copies a file from one Perlbal to another utilizing HTTP
 sub http_copy {
     my %opts = @_;
-    my ($sdevid, $ddevid, $fid, $expected_clen, $intercopy_cb, $errref) =
+    my ($sdevid, $ddevid, $fid, $rfid, $expected_clen, $intercopy_cb, $errref) =
         map { delete $opts{$_} } qw(sdevid
                                     ddevid
                                     fid
+                                    rfid
                                     expected_len
                                     callback
                                     errref
@@ -744,9 +749,11 @@ sub http_copy {
     # handles setting unreachable magic; $error->(reachability, "message")
     my $error_unreachable = sub {
         my $worker = MogileFS::ProcManager->is_child;
-        $worker->send_to_parent(":repl_unreachable $fid");
 
-        MogileFS::FID->new($fid)->mark_unreachable;
+        unless (MogileFS::Config->config('no_unreachable_tracking')) {
+            $worker->send_to_parent(":repl_unreachable $fid");
+            MogileFS::FID->new($fid)->mark_unreachable;
+        }
 
         $$errref = "src_error" if $errref;
         return error("Fid $fid unreachable while replicating: $_[0]");
@@ -796,10 +803,21 @@ sub http_copy {
     my $pipe_closed = 0;
     local $SIG{PIPE} = sub { $pipe_closed = 1; };
 
+    # call a hook for odd casing completely different source data
+    # for specific files.
+    my $shttphost;
+    MogileFS::run_global_hook('replicate_alternate_source',
+                              $rfid, \$shostip, \$sport, \$spath, \$shttphost);
+
     # okay, now get the file
     my $sock = IO::Socket::INET->new(PeerAddr => $shostip, PeerPort => $sport, Timeout => 2)
         or return $src_error->("Unable to create source socket to $shostip:$sport for $spath");
-    $sock->write("GET $spath HTTP/1.0\r\n\r\n");
+    unless ($shttphost) {
+        $sock->write("GET $spath HTTP/1.0\r\n\r\n");
+    } else {
+        # plugin set a custom host.
+        $sock->write("GET $spath HTTP/1.0\r\nHost: $shttphost\r\n\r\n");
+    }
     return error("Pipe closed retrieving $spath from $shostip:$sport")
         if $pipe_closed;
 

@@ -82,7 +82,7 @@ sub was_duplicate_error {
     my $self = shift;
     my $dbh = $self->dbh;
     return 0 unless $dbh->err;
-    return 1 if $dbh->state == '23505' || $dbh->errstr =~ /duplicate/i;
+    return 1 if $dbh->state eq '23505' || $dbh->errstr =~ /duplicate/i;
 }
 
 sub table_exists {
@@ -109,8 +109,9 @@ sub filter_create_sql {
 
     my ($table) = $sql =~ /create\s+table\s+(\S+)/i;
     die "didn't find table" unless $table;
-    if ($self->can("INDEXES_$table")) {
-        $sql =~ s!,\s+INDEX\s*\(.+?\)!!mg;
+    my $index = sprintf 'INDEXES_%s', $table;
+    if ($self->can($index)) {
+        $sql =~ s!,\s*INDEX\s*(\w+)?\s*\(.+?\)!!mgi;
     }
 
     return $sql;
@@ -201,12 +202,20 @@ sub INDEXES_file_to_replicate {
     "CREATE INDEX file_to_replicate_nexttry ON file_to_replicate (nexttry)"
 }
 
+sub INDEXES_file_to_delete2 {
+    "CREATE INDEX file_to_delete2_nexttry ON file_to_delete2 (nexttry)"
+}
+
 sub INDEXES_file_to_delete_later {
     "CREATE INDEX file_to_delete_later_delafter ON file_to_delete_later (delafter)"
 }
 
 sub INDEXES_fsck_log {
     "CREATE INDEX fsck_log_utime ON fsck_log (utime)"
+}
+
+sub INDEXES_file_to_queue {
+    "CREATE INDEX type_nexttry ON file_to_queue (type,nexttry)"
 }
 
 # Extra table

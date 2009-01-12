@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:                mogilefs-server
-version:             2.20
+version:             2.30
 abstract:            MogileFS (distributed filesystem) server.
 license:             ~
 author:              
