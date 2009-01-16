@@ -1237,7 +1237,7 @@ sub get_fids_above_id {
 
     my @ret;
     my $dbh = $self->dbh;
-    my $sth = $dbh->prepare("SELECT fid, dmid, dkey, length, classid ".
+    my $sth = $dbh->prepare("SELECT fid, dmid, dkey, length, classid, devcount ".
                             "FROM   file ".
                             "WHERE  fid > ? ".
                             "ORDER BY fid LIMIT $limit");
