@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 #   Perl Makefile for MogileFS
-#   $Id: Makefile.PL 1220 2008-08-19 07:02:59Z dormando $
+#   $Id: Makefile.PL 1336 2009-10-18 09:30:59Z dormando $
 #
 #   Invoke with 'perl Makefile.PL'
 #
@@ -34,17 +34,12 @@ WriteMakefile(
         'Gearman::Client' => 1.07,  # for Gearman::Worker, in fidsizes worker
         fields            => 0,
     },
-    EXTRA_META              => <<'EXTRA',
-no_index:
-    directory:
-        - lib/mogdeps
-    package:
-        - ProcessHandle
-        - TrackerHandle
-        - MogstoredHandle
-        - MogPath
-        - Mgd
-        - MogPath
-EXTRA
+    META_MERGE              => {
+        no_index => {
+            directory => 'lib/mogdeps',
+            package   => ['ProcessHandle', 'TrackerHandle', 'MogstoredHandle',
+            'MogPath', 'Mgd'],
+        },
+    },
 );
 

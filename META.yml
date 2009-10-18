@@ -1,21 +1,39 @@
-# http://module-build.sourceforge.net/META-spec.html
-#XXXXXXX This is a prototype!!!  It will change in the future!!! XXXXX#
-name:         mogilefs-server
-version:      2.31
-version_from: lib/MogileFS/Server.pm
-installdirs:  site
+--- #YAML:1.0
+name:               mogilefs-server
+version:            2.32
+abstract:           MogileFS (distributed filesystem) server.
+author:
+    - Brad Fitzpatrick <brad@danga.com>
+license:            unknown
+distribution_type:  module
+configure_requires:
+    ExtUtils::MakeMaker:  0
+build_requires:
+    ExtUtils::MakeMaker:  0
 requires:
-    Danga::Socket:                 1.56
-    fields:                        0
-    Gearman::Client:               1.07
-    Gearman::Client::Async:        0.93
-    Gearman::Server:               1.08
-    Getopt::Long:                  0
-    Net::Netmask:                  0
-    Perlbal:                       1.53
-    Symbol:                        0
-    Sys::Syscall:                  0.22
-    Sys::Syslog:                   0
-
-distribution_type: module
-generated_by: ExtUtils::MakeMaker version 6.30
+    Danga::Socket:        1.56
+    fields:               0
+    Gearman::Client:      1.07
+    Gearman::Client::Async:  0.93
+    Gearman::Server:      1.08
+    Getopt::Long:         0
+    Net::Netmask:         0
+    Perlbal:              1.53
+    Symbol:               0
+    Sys::Syscall:         0.22
+    Sys::Syslog:          0
+no_index:
+    directory:
+        - t
+        - inc
+        - lib/mogdeps
+    package:
+        - ProcessHandle
+        - TrackerHandle
+        - MogstoredHandle
+        - MogPath
+        - Mgd
+generated_by:       ExtUtils::MakeMaker version 6.54
+meta-spec:
+    url:      http://module-build.sourceforge.net/META-spec-v1.4.html
+    version:  1.4
