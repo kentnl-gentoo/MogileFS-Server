@@ -9,6 +9,8 @@ use List::Util ();
 # this is incremented whenever the schema changes.  server will refuse
 # to start-up with an old schema version
 #
+# 6: adds file_to_replicate table
+# 7: adds file_to_delete_later table
 # 8: adds fsck_log table
 # 9: adds 'drain' state to enum in device table
 # 10: adds 'replpolicy' column to 'class' table
@@ -359,10 +361,6 @@ use constant TABLES => qw( domain class file tempfile file_to_delete
 sub setup_database {
     my $sto = shift;
 
-    # schema history:
-    #   8: adds fsck_log table
-    #   7: adds file_to_delete_later table
-    #   6: adds file_to_replicate table
     my $curver = $sto->schema_version;
 
     my $latestver = SCHEMA_VERSION;
@@ -481,7 +479,7 @@ sub TABLE_file {
     dkey           VARCHAR(255),     # domain-defined
     UNIQUE dkey  (dmid, dkey),
 
-    length        INT UNSIGNED,        # 4GB limit
+    length        BIGINT UNSIGNED,   # big limit
 
     classid       TINYINT UNSIGNED NOT NULL,
     devcount      TINYINT UNSIGNED NOT NULL,
@@ -933,8 +931,8 @@ sub file_row_from_fidid {
 # classid, devcount" provided a pair of $fidid or undef if no rows.
 sub file_row_from_fidid_range {
     my ($self, $fromfid, $tofid) = @_;
-	my $sth = $self->dbh->prepare("SELECT fid, dmid, dkey, length, classid, devcount ".
-								  "FROM file WHERE fid BETWEEN ? AND ?");
+    my $sth = $self->dbh->prepare("SELECT fid, dmid, dkey, length, classid, devcount ".
+                                  "FROM file WHERE fid BETWEEN ? AND ?");
     $sth->execute($fromfid,$tofid);
     return $sth->fetchall_arrayref({});
 }
@@ -1024,8 +1022,18 @@ sub delete_fidid {
 
 sub delete_tempfile_row {
     my ($self, $fidid) = @_;
-    $self->dbh->do("DELETE FROM tempfile WHERE fid=?", undef, $fidid);
+    my $rv = $self->dbh->do("DELETE FROM tempfile WHERE fid=?", undef, $fidid);
     $self->condthrow;
+    return $rv;
+}
+
+# Load the specified tempfile, then delete it.  If we succeed, we were
+# here first; otherwise, someone else beat us here (and we return undef)
+sub delete_and_return_tempfile_row {
+    my ($self, $fidid) = @_;
+    my $rv = $self->tempfile_row_from_fid($fidid);
+    my $rows_deleted = $self->delete_tempfile_row($fidid);
+    return $rv if ($rows_deleted > 0);
 }
 
 sub replace_into_file {
@@ -1153,10 +1161,8 @@ sub update_devcount {
 sub enqueue_for_replication {
     my ($self, $fidid, $from_devid, $in) = @_;
 
-    my $nexttry = 0;
-    if ($in) {
-        $nexttry = $self->unix_timestamp . " + " . int($in);
-    }
+    $in = 0 unless $in;
+    my $nexttry = $self->unix_timestamp . " + " . int($in);
 
     $self->insert_ignore("INTO file_to_replicate (fid, fromdevid, nexttry) ".
                          "VALUES (?,?,$nexttry)", undef, $fidid, $from_devid);
@@ -1169,10 +1175,8 @@ sub enqueue_for_replication {
 sub enqueue_for_delete2 {
     my ($self, $fidid, $in) = @_;
 
-    my $nexttry = 0;
-    if ($in) {
-        $nexttry = $self->unix_timestamp . " + " . int($in);
-    }
+    $in = 0 unless $in;
+    my $nexttry = $self->unix_timestamp . " + " . int($in);
 
     $self->insert_ignore("INTO file_to_delete2 (fid, nexttry) ".
                          "VALUES (?,$nexttry)", undef, $fidid);
@@ -1182,10 +1186,8 @@ sub enqueue_for_delete2 {
 sub enqueue_for_todo {
     my ($self, $fidid, $type, $in) = @_;
 
-    my $nexttry = 0;
-    if ($in) {
-        $nexttry = $self->unix_timestamp . " + " . int($in);
-    }
+    $in = 0 unless $in;
+    my $nexttry = $self->unix_timestamp . " + " . int($in);
 
     $self->insert_ignore("INTO file_to_queue (fid, type, nexttry) ".
                          "VALUES (?,?,$nexttry)", undef, $fidid, $type);
@@ -1198,10 +1200,9 @@ sub enqueue_many_for_todo {
         $self->enqueue_for_todo($_->{fid}, $type, $in) foreach @$fidids;
         return 1;
     }
-    my $nexttry = 0;
-    if ($in) {
-        $nexttry = $self->unix_timestamp . " + " . int($in);
-    }
+
+    $in = 0 unless $in;
+    my $nexttry = $self->unix_timestamp . " + " . int($in);
 
     # TODO: convert to prepared statement?
     $self->dbh->do($self->ignore_replace . " INTO file_to_queue (fid, type,
@@ -1237,7 +1238,7 @@ sub get_fids_above_id {
 
     my @ret;
     my $dbh = $self->dbh;
-    my $sth = $dbh->prepare("SELECT fid, dmid, dkey, length, classid ".
+    my $sth = $dbh->prepare("SELECT fid, dmid, dkey, length, classid, devcount ".
                             "FROM   file ".
                             "WHERE  fid > ? ".
                             "ORDER BY fid LIMIT $limit");

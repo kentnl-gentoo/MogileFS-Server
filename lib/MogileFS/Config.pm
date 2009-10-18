@@ -10,10 +10,9 @@ our @ISA = qw(Exporter);
 our @EXPORT = qw($DEBUG config set_config);
 our @EXPORT_OK = qw(DEVICE_SUMMARY_CACHE_TIMEOUT);
 
-our ($DEFAULT_CONFIG, $DEFAULT_MOG_ROOT, $MOG_ROOT, $MOGSTORED_STREAM_PORT, $DEBUG);
+our ($DEFAULT_CONFIG, $MOGSTORED_STREAM_PORT, $DEBUG);
 $DEBUG = 0;
 $DEFAULT_CONFIG = "/etc/mogilefs/mogilefsd.conf";
-$DEFAULT_MOG_ROOT = "/mnt/mogilefs";
 $MOGSTORED_STREAM_PORT = 7501;
 
 use constant DEVICE_SUMMARY_CACHE_TIMEOUT => 15;
@@ -56,9 +55,9 @@ our (
     $query_jobs,
     $delete_jobs,
     $replicate_jobs,
+    $fsck_jobs,
     $reaper_jobs,
     $monitor_jobs,
-    $mog_root,
     $min_free_space,
     $max_disk_age,
     $node_timeout,          # time in seconds to wait for storage node responses
@@ -85,14 +84,13 @@ sub load_config {
                              'dbuser=s'      => \$cmdline{db_user},
                              'dbpass:s'      => \$cmdline{db_pass},
                              'user=s'        => \$cmdline{user},
-                             'r|mogroot=s'   => \$cmdline{mog_root},
                              'p|confport=i'  => \$cmdline{conf_port},
                              'l|listen=s@'   => \$cmdline{listen},
                              'w|workers=i'   => \$cmdline{query_jobs},
                              'no_http'       => \$cmdline{no_http},  # OLD, we just eat it to shut it up.
                              'workerport=i'  => \$dummy_workerport,  # eat it for backwards compat
-                             'maxdiskage=i'  => \$cmdline{max_disk_age},
-                             'minfreespace=i' => \$cmdline{min_free_space},
+                             'max_disk_age=i'  => \$cmdline{max_disk_age},
+                             'min_free_space=i' => \$cmdline{min_free_space},
                              'default_mindevcount=i' => \$cmdline{default_mindevcount},
                              'node_timeout=i' => \$cmdline{node_timeout},
                              'pidfile=s'      => \$cmdline{pidfile},
@@ -144,14 +142,12 @@ sub load_config {
     $db_user        = choose_value( 'db_user', "mogile" );
     $db_pass        = choose_value( 'db_pass', "", 1 );
     $conf_port      = choose_value( 'conf_port', 7001 );
-    $MOG_ROOT       = set_config('root',
-                                 choose_value( 'mog_root', $DEFAULT_MOG_ROOT )
-                                 );
     $query_jobs     = set_config("query_jobs",
                                  choose_value( 'listener_jobs', undef) || # undef if not present, then we
                                  choose_value( 'query_jobs', 20 ));       # fall back to query_jobs, new name
     $delete_jobs    = choose_value( 'delete_jobs', 1 );
     $replicate_jobs = choose_value( 'replicate_jobs', 1 );
+    $fsck_jobs      = choose_value( 'fsck_jobs', 1 );
     $reaper_jobs    = choose_value( 'reaper_jobs', 1 );
     $monitor_jobs   = choose_value( 'monitor_jobs', 1 );
     $min_free_space = choose_value( 'min_free_space', 100 );

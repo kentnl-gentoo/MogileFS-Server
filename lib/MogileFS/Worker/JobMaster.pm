@@ -126,7 +126,7 @@ sub _inject_fsck_queues {
 
     my $max_checked = MogileFS::Config->server_setting('fsck_highest_fid_checked') || 0;
     my $to_inject   =
-        MogileFS::Config->server_setting_cached('queue_rate_for_fsck', 30) || 1000;
+        MogileFS::Config->server_setting_cached('queue_rate_for_fsck', 30) || 100;
     my @fids        = $sto->get_fid_hrefs_above_id($max_checked, $to_inject);
     unless (@fids) {
         $sto->set_server_setting("fsck_host", undef);
@@ -151,7 +151,7 @@ sub _inject_fsck_queues {
 sub queue_depth_check {
     my ($depth, $limit) = @_;
     if ($depth == 0) {
-        $limit += 50 unless $limit >= 1000;
+        $limit += 50 unless $limit >= 500;
         return (1, $limit);
     } elsif ($depth / $limit < 0.70) {
         return (1, $limit);

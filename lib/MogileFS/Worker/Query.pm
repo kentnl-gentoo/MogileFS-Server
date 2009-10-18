@@ -8,6 +8,7 @@ use base 'MogileFS::Worker';
 use fields qw(querystarttime reqid);
 use MogileFS::Util qw(error error_code first weighted_list
                       device_state eurl decode_url_args);
+use MogileFS::HTTPFile;
 
 sub new {
     my ($class, $psock) = @_;
@@ -364,8 +365,9 @@ sub cmd_create_close {
 
     my $sto = Mgd::get_store();
 
-    # find the temp file we're closing and making real
-    my $trow = $sto->tempfile_row_from_fid($fidid) or
+    # find the temp file we're closing and making real.  If another worker
+    # already has it, bail out---the client closed it twice.
+    my $trow = $sto->delete_and_return_tempfile_row($fidid) or
         return $self->err_line("no_temp_file");
 
     # if a temp file is closed without a provided-key, that means to
@@ -379,24 +381,30 @@ sub cmd_create_close {
     # see if we have a fid for this key already
     my $old_fid = MogileFS::FID->new_from_dmid_and_key($dmid, $key);
     if ($old_fid) {
+        # Fail if a file already exists for this fid.  Should never
+        # happen, as it should not be possible to close a file twice.
+        return $self->err_line("fid_exists")
+            unless $old_fid->{fidid} != $fidid;
+
         $old_fid->delete;
     }
 
     # get size of file and verify that it matches what we were given, if anything
     my $size = MogileFS::HTTPFile->at($path)->size;
 
-    if ($args->{size} > 0 && ! $size) {
-        # size is either: 0 (file doesn't exist) or undef (host unreachable)
+    # size check is optional? Needs to support zero byte files.
+    $args->{size} = -1 unless $args->{size};
+    if (!defined($size) || $size == MogileFS::HTTPFile::FILE_MISSING) {
+        # storage node is unreachable or the file is missing
         my $type    = defined $size ? "missing" : "cantreach";
         my $lasterr = MogileFS::Util::last_error();
         return $self->err_line("size_verify_error", "Expected: $args->{size}; actual: 0 ($type); path: $path; error: $lasterr")
     }
 
     return $self->err_line("size_mismatch", "Expected: $args->{size}; actual: $size; path: $path")
-        if $args->{size} && ($args->{size} != $size);
+        if $args->{size} > -1 && ($args->{size} != $size);
 
     # TODO: check for EIO?
-    return $self->err_line("empty_file") unless $size;
 
     # insert file_on row
     $dfid->add_to_db;
@@ -411,7 +419,6 @@ sub cmd_create_close {
 
     # mark it as needing replicating:
     $fid->enqueue_for_replication(from_device => $devid);
-    $sto->delete_tempfile_row($fidid);
 
     if ($fid->update_devcount) {
         # call the hook - if this fails, we need to back the file out
@@ -749,8 +756,10 @@ sub cmd_create_host {
         $args->{status} ||= 'down';
     }
 
-    return $self->err_line('unknown_state')
-        unless MogileFS::Host->valid_initial_state($args->{status});
+    if ($args->{status}) {
+        return $self->err_line('unknown_state')
+            unless MogileFS::Host->valid_initial_state($args->{status});
+    }
 
     # arguments all good, let's do it.
 
@@ -790,7 +799,7 @@ sub cmd_delete_host {
 
     foreach my $dev (MogileFS::Device->devices) {
         return $self->err_line('host_not_empty')
-            if $dev->hostid == $hostid && $dev->status ne "dead";
+            if $dev->hostid == $hostid;
     }
 
     $host->delete;
@@ -1178,11 +1187,12 @@ sub cmd_stats {
     my %classes;
     my $rows;
 
-    $rows = $dbh->selectall_arrayref('SELECT class.dmid, namespace, classid, classname ' .
-                                     'FROM domain, class WHERE class.dmid = domain.dmid');
+    $rows = $dbh->selectall_arrayref('SELECT d.dmid, d.namespace, c.classid, c.classname ' .
+                                     'FROM domain d LEFT JOIN class c ON c.dmid=d.dmid');
+
     foreach my $row (@$rows) {
         $classes{$row->[0]}->{name} = $row->[1];
-        $classes{$row->[0]}->{classes}->{$row->[2]} = $row->[3];
+        $classes{$row->[0]}->{classes}->{$row->[2] || 0} = $row->[3] || 'default';
     }
     $classes{$_}->{classes}->{0} = 'default'
         foreach keys %classes;
@@ -1542,6 +1552,7 @@ sub err_line {
         'no_host' => "No host provided",
         'no_ip' => "IP required to create host",
         'no_port' => "Port required to create host",
+        'no_temp_file' => "No tempfile or file already closed",
         'none_match' => "No keys match that pattern and after-value (if any).",
         'plugin_aborted' => "Action aborted by plugin",
         'state_too_high' => "Status cannot go from dead to alive; must use down",

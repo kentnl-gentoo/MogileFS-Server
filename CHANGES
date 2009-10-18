@@ -1,3 +1,25 @@
+2009-10-18: Release version 2.31
+
+        * Fix create_close race condition. (pipegeek)
+
+        * Fix bug in reporting of available disk space.
+
+        * Many minor bug/documentation fixes.
+
+        * MySQL and Postgres installs now use BIGINT's for fid/length by
+          default. (dormando, robbat2)
+
+        * Accept 405 responses to MKCOL from the WebDAV server since it often
+          just means that the directory already exists. (Ask Bjørn Hansen)
+
+        * Fix showing domain and class in mogadm output when there's only the
+          default class in the domain (Mark Imbriaco)
+
+        * mogstored: pidfile support
+
+        * New FSCK work and error for BCNT for bad devcount values (they would
+          not otherwise be caught unless the triggered another fix).
+
 2009-01-12: Release version 2.30
 
         * fsck will now fix broken 'devcount' cols.

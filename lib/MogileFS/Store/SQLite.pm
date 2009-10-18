@@ -32,6 +32,25 @@ sub can_replace { 1 }
 sub can_insertignore { 0 }
 sub unix_timestamp { "strftime('%s','now')" }
 
+# DBD::SQLite doesn't really have any table meta info methods
+# And PRAGMA table_info() does not return "real" rows
+sub column_type {
+    my ($self, $table, $col) = @_;
+    my $sth = $self->dbh->prepare("PRAGMA table_info($table)");
+    $sth->execute;
+    while (my $rec = $sth->fetchrow_arrayref) {
+        if ($rec->[1] eq $col) {
+            $sth->finish;
+            return $rec->[2];
+        }
+    }
+    return undef;
+}
+
+# Implement these for native database locking
+# sub get_lock {}
+# sub release_lock {}
+
 # --------------------------------------------------------------------------
 # Store-related things we override
 # --------------------------------------------------------------------------
@@ -174,6 +193,13 @@ sub INDEXES_fsck_log {
     ("CREATE INDEX utime ON fsck_log (utime)");
 }
 
+sub INDEXES_file_to_queue {
+    ("CREATE INDEX type_nexttry ON file_to_queue (type,nexttry)");
+}
+sub INDEXES_file_to_delete2 {
+    ("CREATE INDEX file_to_delete2_nexttry ON file_to_delete2 (nexttry)");
+}
+
 sub filter_create_sql {
     my ($self, $sql) = @_;
     $sql =~ s/\bENUM\(.+?\)/TEXT/g;
@@ -181,7 +207,7 @@ sub filter_create_sql {
     my ($table) = $sql =~ /create\s+table\s+(\S+)/i;
     die "didn't find table" unless $table;
     if ($self->can("INDEXES_$table")) {
-        $sql =~ s!,\s+INDEX\s+\(.+?\)!!mg;
+        $sql =~ s!,\s+INDEX\s+(\w+\s+)?\(.+?\)!!mg;
     }
 
     return $sql;

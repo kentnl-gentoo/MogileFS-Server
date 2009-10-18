@@ -35,7 +35,7 @@ BEGIN {
 
 use IO::Socket::INET;
 use POSIX qw(WNOHANG);
-use Perlbal 1.53;
+use Perlbal 1.73;
 use FindBin qw($Bin $RealScript);
 use Gearman::Server 1.08;
 use Gearman::Client::Async 0.93;
@@ -68,6 +68,7 @@ my $docroot     = "/var/mogdata";
 my $default_config = "/etc/mogilefs/mogstored.conf";
 my $server      = $ENV{MOGSTORED_SERVER_TYPE} || "perlbal";
 my $serverbin   = "";
+my $pidfile     = undef;
 
 # Rename binary in process list to make init scripts saner
 $0 = "mogstored";
@@ -82,6 +83,7 @@ my %config_opts = (
                    'maxconns=i'   => \$max_conns,
                    'server=s'     => \$server,
                    'serverbin=s'  => \$serverbin,
+                   'pidfile=s'    => \$pidfile,
                    );
 usage() unless Getopt::Long::GetOptions(%config_opts);
 
@@ -92,7 +94,7 @@ $opt_config = $default_config if ! $opt_config && -e $default_config;
 load_config_file($opt_config => \%config_opts) if $opt_config;
 
 # initialize basic required Perlbal machinery, for any HTTP server
-Perlbal::run_manage_commands(qq{
+my $perlbal_init = qq{
    CREATE SERVICE mogstored
      SET role = web_server
      SET docroot = $docroot
@@ -101,7 +103,9 @@ Perlbal::run_manage_commands(qq{
     CREATE SERVICE mgmt
        SET role = management
      ENABLE mgmt
-}, sub { print STDERR "$_[0]\n"; });
+};
+$perlbal_init .= "\nSERVER pidfile = $pidfile" if defined($pidfile);
+Perlbal::run_manage_commands($perlbal_init , sub { print STDERR "$_[0]\n"; });
 
 # start HTTP server
 my $httpsrv_class = "Mogstored::HTTPServer::" . ucfirst($server);
@@ -155,6 +159,7 @@ OPTS:
  --httplisten=<ip:port> IP/Port HTTP server listens on
  --mgmtlisten=<ip:port> IP/Port management/sidechannel listens on
  --docroot=<path>       Docroot above device mount points.  Defaults to /var/mogdata
+ --maxconns=<number>    Number of simultaneous clients to serve. Default 10000
 ";
 
 }

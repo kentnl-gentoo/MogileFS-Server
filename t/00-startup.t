@@ -20,7 +20,7 @@ find_mogclient_or_skip();
 
 my $sto = eval { temp_store(); };
 if ($sto) {
-    plan tests => 59;
+    plan tests => 63;
 } else {
     plan skip_all => "Can't create temporary test database: $@";
     exit 0;
@@ -107,6 +107,36 @@ ok($tmptrack->mogadm("device", "add", "hostB", 4), "created dev4 on hostB");
         or die "Failed to wait for monitor";
     $be->{timeout} = $was;
 }
+
+{
+    my $fh = $mogc->new_file('no_content', "2copies");
+    ok(close($fh), "closed file");
+}
+
+{
+    my $fh = $mogc->new_file('no_content', "2copies");
+    ok(close($fh), "closed file");
+}
+
+# wait for it to replicate
+ok(try_for(10, sub {
+    my @urls = $mogc->get_paths("no_content");
+    my $nloc = @urls;
+    if ($nloc < 2) {
+        diag("no_content still only on $nloc devices");
+        return 0;
+    }
+    return 1;
+}), "replicated to 2 paths");
+
+ok(try_for(3, sub {
+    my $to_repl_rows = $dbh->selectrow_array("SELECT COUNT(*) FROM file_to_replicate");
+    return $to_repl_rows == 0;
+}), "no more files to replicate");
+
+# quick delete test
+ok($mogc->delete("no_content"), "deleted no_content")
+    or die "Error: " . $mogc->errstr;
 
 # create two sample files
 my $data = "My test file.\n" x 1024;
@@ -229,7 +259,9 @@ ok(try_for(40, sub {
 }), "files replicated to hostC from hostB");
 
 # kill hostB now
-ok($tmptrack->mogadm("host", "delete", "hostB"), "killed hostB");
+# hosts are no longer able to be nuked even if they have deleted devices.
+# this saves us from some subtle bugs.
+#ok($tmptrack->mogadm("host", "delete", "hostB"), "killed hostB");
 
 # delete them all, see if they go away.
 for my $n (1..$n_files) {
