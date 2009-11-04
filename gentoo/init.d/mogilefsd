@@ -6,8 +6,8 @@ MOGILE_UID="mogile"
 MOGILE_GID="mogile"
 
 depend() {
-	use net
-	after mysql
+	use net mysql postgresql
+	after mysql postgresql
 }
 
 start() {

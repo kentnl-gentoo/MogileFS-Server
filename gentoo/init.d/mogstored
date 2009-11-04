@@ -5,7 +5,6 @@ BINARY="/usr/bin/mogstored"
 
 depend() {
 	use net
-	after mysql
 	before mogilefsd
 }
 
