@@ -202,6 +202,10 @@ sub make_new_child {
     my $pid;
     my $sigset;
 
+    # Ensure our dbh is closed before we fork anything.
+    # Causes problems on some platforms (Solaris+Postgres)
+    Mgd::close_store();
+
     # block signal for fork
     $sigset = POSIX::SigSet->new(SIGINT);
     sigprocmask(SIG_BLOCK, $sigset)
@@ -580,12 +584,6 @@ Mogilefsd admin commands:
     !jobs       Outstanding job counts, desired level, and pids.
     !shutdown   Immediately kill all of mogilefsd.
 
-    !replication
-                (Deprecated/old)
-                See the replication status for un-replicated files.
-                Output format:
-                <domain> <class> <devcount> <files>
-
     !to <job class> <message>
                 Send <message> to all workers of <job class>.
                 Mostly used for debugging.
@@ -807,10 +805,11 @@ sub is_child {
 sub state_change {
     my ($what, $whatid, $state, $exclude) = @_;
     my $key = "$what-$whatid";
+    my $now = time();
     foreach my $child (values %child) {
         my $old = $child->{known_state}{$key} || "";
-        if ($old ne $state) {
-            $child->{known_state}{$key} = $state;
+        if (!$old || $old->[1] ne $state || $old->[0] < $now - 300) {
+            $child->{known_state}{$key} = [$now, $state];
 
             $child->write(":state_change $what $whatid $state\r\n")
                 unless $exclude && $child == $exclude;

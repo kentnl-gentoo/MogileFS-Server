@@ -38,7 +38,6 @@ sub set_config_no_broadcast {
     return $conf{$k} = $v;
 }
 
-set_config("mogstored_stream_port" => $MOGSTORED_STREAM_PORT);
 set_config('default_mindevcount', 2);
 
 our (
@@ -58,6 +57,7 @@ our (
     $fsck_jobs,
     $reaper_jobs,
     $monitor_jobs,
+    $max_handles,
     $min_free_space,
     $max_disk_age,
     $node_timeout,          # time in seconds to wait for storage node responses
@@ -93,6 +93,7 @@ sub load_config {
                              'min_free_space=i' => \$cmdline{min_free_space},
                              'default_mindevcount=i' => \$cmdline{default_mindevcount},
                              'node_timeout=i' => \$cmdline{node_timeout},
+                             'max_handles=i'  => \$cmdline{max_handles},
                              'pidfile=s'      => \$cmdline{pidfile},
                              'no_schema_check' => \$cmdline{no_schema_check},
                              'old_repl_compat=i' => \$cmdline{old_repl_compat},
@@ -100,6 +101,7 @@ sub load_config {
                              'repl_use_get_port=i' => \$cmdline{repl_use_get_port},
                              'local_network=s' => \$cmdline{local_network},
                              'no_unreachable_tracking' => \$cmdline{no_unreachable_tracking},
+                             'mogstored_stream_port' => \$cmdline{mogstored_stream_port},
                              );
 
     # warn of old/deprecated options
@@ -152,9 +154,11 @@ sub load_config {
     $monitor_jobs   = choose_value( 'monitor_jobs', 1 );
     $min_free_space = choose_value( 'min_free_space', 100 );
     $max_disk_age   = choose_value( 'max_disk_age', 5 );
+    $max_handles    = choose_value( 'max_handles', 0 );
     $DEBUG          = choose_value( 'debug', $ENV{DEBUG} || 0 );
     $pidfile        = choose_value( 'pidfile', "" );
 
+    choose_value( 'mogstored_stream_port', $MOGSTORED_STREAM_PORT );
     choose_value( 'default_mindevcount', 2 );
     $node_timeout   = choose_value( 'node_timeout', 2 );
 
@@ -302,6 +306,12 @@ sub server_setting_is_writable {
         return "1" if $v =~ /^(1|t|on|y)/i;
         die "Unknown format";
     };
+    my $num          = sub {
+        my $v = shift;
+        return "0" unless $v;
+        return $v if $v =~ /^\d+$/;
+        die "Must be numeric";
+    };
     my $matchre      = sub {
         my $re = shift;
         return sub {
@@ -326,6 +336,7 @@ sub server_setting_is_writable {
     if ($key =~ /^slave_/) { return $del_if_blank };
     if ($key eq "enable_rebalance") { return $bool };
     if ($key eq "memcache_servers") { return $any  };
+    if ($key eq "internal_queue_limit") { return $num };
 
     # ReplicationPolicy::MultipleNetworks
     if ($key eq 'network_zones') { return $any };

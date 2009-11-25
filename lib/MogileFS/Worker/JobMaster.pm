@@ -15,6 +15,9 @@ use MogileFS::Util qw(every error debug eurl);
 
 use constant FSCK_QUEUE => 1;
 
+use constant DEF_FSCK_QUEUE_MAX => 20_000;
+use constant DEF_FSCK_QUEUE_INJECT => 1000;
+
 sub new {
     my ($class, $psock) = @_;
     my $self = fields::new($class);
@@ -124,9 +127,17 @@ sub _inject_fsck_queues {
     my $self = shift;
     my $sto  = shift;
 
+    $sto->fsck_log_summarize;
+    my $queue_size = $sto->file_queue_length(FSCK_QUEUE);
+    my $max_queue  =
+        MogileFS::Config->server_setting_cached('queue_size_for_fsck', 60) ||
+            DEF_FSCK_QUEUE_MAX;
+    return if ($queue_size >= $max_queue);
+
     my $max_checked = MogileFS::Config->server_setting('fsck_highest_fid_checked') || 0;
     my $to_inject   =
-        MogileFS::Config->server_setting_cached('queue_rate_for_fsck', 30) || 100;
+        MogileFS::Config->server_setting_cached('queue_rate_for_fsck', 60) ||
+            DEF_FSCK_QUEUE_INJECT;
     my @fids        = $sto->get_fid_hrefs_above_id($max_checked, $to_inject);
     unless (@fids) {
         $sto->set_server_setting("fsck_host", undef);
@@ -149,9 +160,13 @@ sub _inject_fsck_queues {
 # so we don't hammer the DB with giant transactions, but loop
 # fast trying to keep the queue full.
 sub queue_depth_check {
+    my $max_limit =
+        MogileFS::Config->server_setting_cached('internal_queue_limit', 120)
+            || 500;
+
     my ($depth, $limit) = @_;
     if ($depth == 0) {
-        $limit += 50 unless $limit >= 500;
+        $limit += 50 unless $limit >= $max_limit;
         return (1, $limit);
     } elsif ($depth / $limit < 0.70) {
         return (1, $limit);

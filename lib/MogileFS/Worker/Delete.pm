@@ -64,8 +64,9 @@ sub work {
         unless ($tempres || $delres || $delres2) {
             $sleep_for++ if $sleep_for < $sleep_max;
             sleep $sleep_for;
+        } else {
+            $sleep_for = 0;
         }
-        $sleep_for = 0;
     }
 
 }
@@ -132,7 +133,7 @@ sub process_tempfiles {
     return 0 unless @fidids;
 
     $sto->mass_insert_file_on(@devfids);
-    $sto->enqueue_fids_to_delete(@fidids);
+    $sto->enqueue_fids_to_delete2(@fidids);
     $sto->dbh->do("DELETE FROM tempfile WHERE fid IN (" . join(',', @fidids) . ")");
     return 1;
 }

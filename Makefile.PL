@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 #   Perl Makefile for MogileFS
-#   $Id: Makefile.PL 1336 2009-10-18 09:30:59Z dormando $
+#   $Id: Makefile.PL 1366 2009-11-25 00:51:22Z dormando $
 #
 #   Invoke with 'perl Makefile.PL'
 #
@@ -23,15 +23,12 @@ WriteMakefile(
     EXE_FILES               => $exefiles,
     PREREQ_PM               => {
         'Danga::Socket'    => '1.56',
-        'Perlbal'          => '1.53',
+        'Perlbal'          => '1.73',
         'Sys::Syslog'      => 0,
         'Sys::Syscall'     => '0.22',
         'Getopt::Long'     => 0,
         'Symbol'           => 0,
         'Net::Netmask'     => 0,
-        'Gearman::Server'  => 1.08,  # but really want at least 1.09
-        'Gearman::Client::Async' => 0.93,
-        'Gearman::Client' => 1.07,  # for Gearman::Worker, in fidsizes worker
         fields            => 0,
     },
     META_MERGE              => {

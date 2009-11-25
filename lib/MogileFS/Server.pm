@@ -2,7 +2,7 @@ package MogileFS::Server;
 use strict;
 use warnings;
 use vars qw($VERSION);
-$VERSION = "2.32";
+$VERSION = "2.33";
 
 =head1 NAME
 
@@ -240,6 +240,15 @@ sub get_store {
     return $store if $store && $store_pid == $$;
     $store_pid = $$;
     return $store = MogileFS::Store->new;
+}
+
+sub close_store {
+    if ($store) {
+        $store->dbh->disconnect();
+        $store = undef;
+        return 1;
+    }
+    return 0;
 }
 
 # only for t/ scripts to explicitly set a store, without loading in a config
