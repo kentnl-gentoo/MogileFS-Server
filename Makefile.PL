@@ -33,7 +33,6 @@ WriteMakefile(
     },
     META_MERGE              => {
         no_index => {
-            directory => 'lib/mogdeps',
             package   => ['ProcessHandle', 'TrackerHandle', 'MogstoredHandle',
             'MogPath', 'Mgd'],
         },
