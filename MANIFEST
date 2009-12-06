@@ -99,7 +99,6 @@ lib/Mogstored/SideChannelClient.pm
 lib/Mogstored/SideChannelListener.pm
 Makefile.PL
 MANIFEST
-META.yml			Module meta-data (added by MakeMaker)
 mogautomount
 mogdbsetup
 mogilefsd
@@ -117,3 +116,5 @@ t/replpolicy.t
 t/store.t
 t/util.t
 TODO
+TESTING
+META.yml                                 Module meta-data (added by MakeMaker)
