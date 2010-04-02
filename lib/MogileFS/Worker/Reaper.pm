@@ -14,6 +14,10 @@ sub new {
     return $self;
 }
 
+sub watchdog_timeout {
+    return 240;
+}
+
 my %all_empty;  # devid -> bool, if all empty of files in file_on
 
 sub work {
@@ -36,6 +40,7 @@ sub work {
                 $all_empty{$devid} = 1;
                 next;
             }
+            $self->parent_ping;
 
             foreach my $fid (@fids) {
                 # order is important here:

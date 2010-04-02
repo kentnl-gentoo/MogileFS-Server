@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               mogilefs-server
-version:            2.34
+version:            2.35
 abstract:           MogileFS (distributed filesystem) server.
 author:
     - Brad Fitzpatrick <brad@danga.com>
@@ -11,14 +11,17 @@ configure_requires:
 build_requires:
     ExtUtils::MakeMaker:  0
 requires:
-    Danga::Socket:  1.56
-    fields:         0
-    Getopt::Long:   0
-    Net::Netmask:   0
-    Perlbal:        1.73
-    Symbol:         0
-    Sys::Syscall:   0.22
-    Sys::Syslog:    0
+    Danga::Socket:     1.56
+    DBI:               0
+    fields:            0
+    Getopt::Long:      0
+    IO::AIO:           0
+    MogileFS::Client:  0
+    Net::Netmask:      0
+    Perlbal:           1.73
+    Symbol:            0
+    Sys::Syscall:      0.22
+    Sys::Syslog:       0
 no_index:
     directory:
         - t
@@ -30,7 +33,7 @@ no_index:
         - MogstoredHandle
         - MogPath
         - Mgd
-generated_by:       ExtUtils::MakeMaker version 6.54
+generated_by:       ExtUtils::MakeMaker version 6.56
 meta-spec:
     url:      http://module-build.sourceforge.net/META-spec-v1.4.html
     version:  1.4

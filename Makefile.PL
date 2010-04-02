@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 #   Perl Makefile for MogileFS
-#   $Id: Makefile.PL 1366 2009-11-25 00:51:22Z dormando $
+#   $Id: Makefile.PL 1410 2010-03-24 07:07:27Z dormando $
 #
 #   Invoke with 'perl Makefile.PL'
 #
@@ -30,6 +30,9 @@ WriteMakefile(
         'Symbol'           => 0,
         'Net::Netmask'     => 0,
         fields            => 0,
+        'IO::AIO'         => 0,
+        'MogileFS::Client' => 0,
+        DBI                => 0,
     },
     META_MERGE              => {
         no_index => {

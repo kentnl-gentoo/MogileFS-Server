@@ -324,16 +324,16 @@ sub cmd_create_open {
 }
 
 sub sort_devs_by_freespace {
-    my @devices_with_weights;
+    my @devices_with_weights = map {
+        [$_, 100 * $_->percent_free]
+    } sort {
+        $b->percent_free <=> $a->percent_free;
+    } grep {
+        $_->exists;
+    } @_;
 
-    foreach my $dev (@_) {
-        next unless $dev->exists;
-
-        my $weight = 100 * $dev->percent_free;
-        push @devices_with_weights, [$dev, $weight];
-    }
-
-    my @list = MogileFS::Util::weighted_list(@devices_with_weights);
+    my @list =
+        MogileFS::Util::weighted_list(splice(@devices_with_weights, 0, 20));
 
     return @list;
 }
@@ -507,7 +507,7 @@ sub cmd_list_keys {
         or return $self->err_line('domain_not_found');
     my ($prefix, $after, $limit) = ($args->{prefix}, $args->{after}, $args->{limit});
 
-    if ($prefix) {
+    if (defined $prefix and $prefix ne '') {
         # now validate that after matches prefix
         return $self->err_line('after_mismatch')
             if $after && $after !~ /^$prefix/;
@@ -688,6 +688,14 @@ sub cmd_create_class {
     my $mindevcount = $args->{mindevcount}+0;
     return $self->err_line('invalid_mindevcount') unless $mindevcount > 0;
 
+    my $replpolicy = $args->{replpolicy} || '';
+    if ($replpolicy) {
+        eval {
+            MogileFS::ReplicationPolicy->new_from_policy_string($replpolicy);
+        };
+        return $self->err_line('invalid_replpolicy', $@) if $@;
+    }
+
     my $dom  = MogileFS::Domain->of_namespace($domain) or
         return $self->err_line('domain_not_found');
 
@@ -700,6 +708,8 @@ sub cmd_create_class {
         $cls = $dom->create_class($class);
     }
     $cls->set_mindevcount($mindevcount);
+    # don't erase an existing replpolicy if we're not setting a new one.
+    $cls->set_replpolicy($replpolicy) if $replpolicy;
 
     # return success
     return $self->ok_line({ class => $class, mindevcount => $mindevcount, domain => $domain });
@@ -823,6 +833,8 @@ sub cmd_get_domains {
             $cl_n++;
             $ret->{"domain${dm_n}class${cl_n}name"}        = $cl->name;
             $ret->{"domain${dm_n}class${cl_n}mindevcount"} = $cl->mindevcount;
+            $ret->{"domain${dm_n}class${cl_n}replpolicy"}  =
+                $cl->repl_policy_string;
         }
         $ret->{"domain${dm_n}classes"} = $cl_n;
     }

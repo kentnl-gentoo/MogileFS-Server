@@ -1,3 +1,29 @@
+2010-04-02: Release version 2.35
+
+        * Nuke ancient mogilefs 1.1 replication code.
+          no_unreachable_tracking and old_repl_compat variables are gone.
+          (dormando)
+
+        * Support modifying class replpolicy strings (requires new
+          mogadm/MogileFS::Client) (dormando)
+
+        * Print fidid and devid on errors when fsck fails to fix something
+          (t0m)
+
+        * Allow list_keys to work with a prefix of '0' (dormando)
+
+        * Print timestamp when logging to STDOUT (t0m)
+
+        * Sort by free space and weight fewer devices to avoid CPU churn
+          (dormando)
+
+        * Fix deadlock-related crash bugs in db queue fetch routines.
+
+        * Fix dependencies in MogileFS::Server (t0m)
+
+        * Fix bug in list_keys command that prevented searches with a
+          '0' prefix. (Ask Bjørn Hansen)
+
 2009-12-05: Release version 2.34
 
         * Fix bug in new copycount reduction code. If it was more than off by

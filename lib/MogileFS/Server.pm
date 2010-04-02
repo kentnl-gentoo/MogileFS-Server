@@ -2,7 +2,7 @@ package MogileFS::Server;
 use strict;
 use warnings;
 use vars qw($VERSION);
-$VERSION = "2.34";
+$VERSION = "2.35";
 
 =head1 NAME
 
@@ -267,7 +267,7 @@ sub log {
         my $mask = shift; # format string
         $mask .= "\n" unless $mask =~ /\n$/;
         my $message = @_ ? sprintf($mask, @_) : $mask;
-        print $message;
+        print '[', scalar localtime(), '] ', $message;
     } else {
         # just pass the parameters to syslog
         Sys::Syslog::syslog(@_);
