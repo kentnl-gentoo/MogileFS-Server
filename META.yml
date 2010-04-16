@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               mogilefs-server
-version:            2.35
+version:            2.36
 abstract:           MogileFS (distributed filesystem) server.
 author:
     - Brad Fitzpatrick <brad@danga.com>
@@ -18,7 +18,7 @@ requires:
     IO::AIO:           0
     MogileFS::Client:  0
     Net::Netmask:      0
-    Perlbal:           1.73
+    Perlbal:           1.75
     Symbol:            0
     Sys::Syscall:      0.22
     Sys::Syslog:       0

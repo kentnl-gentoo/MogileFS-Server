@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 #   Perl Makefile for MogileFS
-#   $Id: Makefile.PL 1410 2010-03-24 07:07:27Z dormando $
+#   $Id: Makefile.PL 1449 2010-04-16 21:37:56Z dormando $
 #
 #   Invoke with 'perl Makefile.PL'
 #
@@ -23,7 +23,7 @@ WriteMakefile(
     EXE_FILES               => $exefiles,
     PREREQ_PM               => {
         'Danga::Socket'    => '1.56',
-        'Perlbal'          => '1.73',
+        'Perlbal'          => '1.75',
         'Sys::Syslog'      => 0,
         'Sys::Syscall'     => '0.22',
         'Getopt::Long'     => 0,
