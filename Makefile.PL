@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 #   Perl Makefile for MogileFS
-#   $Id: Makefile.PL 1449 2010-04-16 21:37:56Z dormando $
+#   $Id: Makefile.PL 1464 2010-08-13 20:24:16Z dormando $
 #
 #   Invoke with 'perl Makefile.PL'
 #
@@ -23,7 +23,7 @@ WriteMakefile(
     EXE_FILES               => $exefiles,
     PREREQ_PM               => {
         'Danga::Socket'    => '1.56',
-        'Perlbal'          => '1.75',
+        'Perlbal'          => '1.76',
         'Sys::Syslog'      => 0,
         'Sys::Syscall'     => '0.22',
         'Getopt::Long'     => 0,
@@ -40,6 +40,13 @@ WriteMakefile(
             package   => ['ProcessHandle', 'TrackerHandle', 'MogstoredHandle',
             'MogPath', 'Mgd'],
         },
+          resources => {
+            homepage    =>      'http://danga.com/mogilefs/',
+            bugtracker  =>      'http://rt.cpan.org/Public/Dist/Display.html?Name=mogilefs-server',
+            repository  =>      'http://code.sixapart.com/svn/mogilefs/',
+            MailingList =>      'http://groups.google.com/group/mogile',
+        },
+
     },
 );
 

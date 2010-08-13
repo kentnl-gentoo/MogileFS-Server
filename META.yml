@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               mogilefs-server
-version:            2.36
+version:            2.37
 abstract:           MogileFS (distributed filesystem) server.
 author:
     - Brad Fitzpatrick <brad@danga.com>
@@ -18,10 +18,15 @@ requires:
     IO::AIO:           0
     MogileFS::Client:  0
     Net::Netmask:      0
-    Perlbal:           1.75
+    Perlbal:           1.76
     Symbol:            0
     Sys::Syscall:      0.22
     Sys::Syslog:       0
+resources:
+    bugtracker:   http://rt.cpan.org/Public/Dist/Display.html?Name=mogilefs-server
+    homepage:     http://danga.com/mogilefs/
+    MailingList:  http://groups.google.com/group/mogile
+    repository:   http://code.sixapart.com/svn/mogilefs/
 no_index:
     directory:
         - t
@@ -33,7 +38,7 @@ no_index:
         - MogstoredHandle
         - MogPath
         - Mgd
-generated_by:       ExtUtils::MakeMaker version 6.56
+generated_by:       ExtUtils::MakeMaker version 6.55_02
 meta-spec:
     url:      http://module-build.sourceforge.net/META-spec-v1.4.html
     version:  1.4

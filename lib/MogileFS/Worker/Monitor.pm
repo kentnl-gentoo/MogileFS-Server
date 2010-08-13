@@ -13,6 +13,7 @@ use fields (
             );
 
 use Danga::Socket 1.56;
+use MogileFS::Config;
 use MogileFS::Util qw(error debug);
 use MogileFS::IOStatWatcher;
 
@@ -45,14 +46,17 @@ sub work {
         my ($hostname, $stats) = @_;
 
         while (my ($devid, $util) = each %$stats) {
-            my $dev = MogileFS::Device->of_devid($devid) or die "Can't find that device";
+            # Lets not propagate devices that we accidentally find.
+            # This does hit the DB every time a device does not exist, so
+            # perhaps should add negative caching in the future.
+            my $dev = MogileFS::Device->of_devid($devid);
+            next unless $dev->exists;
             $dev->set_observed_utilization($util);
         }
     });
 
     my $main_monitor;
     $main_monitor = sub {
-        Danga::Socket->AddTimer(2.5, $main_monitor);
         $self->parent_ping;
 
         # get db and note we're starting a run
@@ -74,6 +78,10 @@ sub work {
 
         $iow->set_hosts(keys %{$self->{seen_hosts}});
         $self->send_to_parent(":monitor_just_ran");
+
+        # Make sure we sleep for at least 2.5 seconds before running again.
+        # If there's a die above, the monitor will be restarted.
+        Danga::Socket->AddTimer(2.5, $main_monitor);
     };
 
     $main_monitor->();
@@ -85,7 +93,7 @@ sub work {
 sub ua {
     my $self = shift;
     return $self->{ua} ||= LWP::UserAgent->new(
-                                               timeout    => 2,
+                                               timeout    => MogileFS::Config->config('conn_timeout') || 2,
                                                keep_alive => 20,
                                                );
 }
@@ -104,7 +112,7 @@ sub check_device {
     $self->{seen_hosts}{$hostip} = 1;
 
     # now try to get the data with a short timeout
-    my $timeout = 2;
+    my $timeout = MogileFS::Config->config('conn_timeout') || 2;
     my $start_time = Time::HiRes::time();
 
     my $ua       = $self->ua;

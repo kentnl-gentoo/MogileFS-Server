@@ -2,7 +2,7 @@ package MogileFS::Store;
 use strict;
 use warnings;
 use Carp qw(croak);
-use MogileFS::Util qw(throw max);
+use MogileFS::Util qw(throw max error);
 use DBI;  # no reason a Store has to be DBI-based, but for now they all are.
 use List::Util ();
 
@@ -186,8 +186,18 @@ sub _slaves_list {
     my @ret;
     foreach my $key (split /\s*,\s*/, $sk) {
         my $slave = MogileFS::Config->server_setting("slave_$key");
+
+        if (!$slave) {
+            error("key for slave DB config: slave_$key not found in configuration");
+            next;
+        }
+
         my ($dsn, $user, $pass) = split /\|/, $slave;
-        push @ret, [$dsn, $user, $pass];
+        if (!defined($dsn) or !defined($user) or !defined($pass)) {
+            error("key slave_$key contains $slave, which doesn't split in | into DSN|user|pass - ignoring");
+            next;
+        }
+        push @ret, [$dsn, $user, $pass]
     }
 
     $self->{slave_list_cache}     = \@ret;
@@ -1211,6 +1221,18 @@ sub update_devcount {
               $ct, $fidid); };
     $self->condthrow;
 
+    return 1;
+}
+
+# update the classid for a given fidid
+sub update_classid {
+    my ($self, $fidid, $classid) = @_;
+    my $dbh = $self->dbh;
+
+    $dbh->do("UPDATE file SET classid=? WHERE fid=?", undef,
+              $classid, $fidid);
+
+    $self->condthrow;
     return 1;
 }
 
