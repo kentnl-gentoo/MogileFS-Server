@@ -1,7 +1,7 @@
 #!/usr/bin/perl
 #
 #   Perl Makefile for MogileFS
-#   $Id: Makefile.PL 1464 2010-08-13 20:24:16Z dormando $
+#   $Id$
 #
 #   Invoke with 'perl Makefile.PL'
 #

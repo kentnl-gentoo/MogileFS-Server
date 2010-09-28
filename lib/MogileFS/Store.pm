@@ -16,7 +16,9 @@ use List::Util ();
 # 10: adds 'replpolicy' column to 'class' table
 # 11: adds 'file_to_queue' table
 # 12: adds 'file_to_delete2' table
-use constant SCHEMA_VERSION => 12;
+# 13: modifies 'server_settings.value' to TEXT for wider values
+#     also adds a TEXT 'arg' column to file_to_queue for passing arguments
+use constant SCHEMA_VERSION => 13;
 
 sub new {
     my ($class) = @_;
@@ -378,6 +380,9 @@ sub retry_on_deadlock {
     while ($tries-- > 0) {
         $rv = eval { $code->(); };
         next if ($self->was_deadlock_error);
+        if ($@) {
+            croak($@) unless $self->dbh->err;
+        }
         last;
     }
     return $rv;
@@ -428,6 +433,8 @@ sub setup_database {
     $sto->upgrade_add_device_readonly;
     $sto->upgrade_add_device_drain;
     $sto->upgrade_add_class_replpolicy;
+    $sto->upgrade_modify_server_settings_value;
+    $sto->upgrade_add_file_to_queue_arg;
 
     return 1;
 }
@@ -629,7 +636,7 @@ sub TABLE_device {
 sub TABLE_server_settings {
     "CREATE TABLE server_settings (
     field   VARCHAR(50) PRIMARY KEY,
-    value   VARCHAR(255)
+    value   TEXT
     )"
 }
 
@@ -682,6 +689,7 @@ sub TABLE_file_to_queue {
     nexttry   INT UNSIGNED NOT NULL,
     failcount TINYINT UNSIGNED NOT NULL default '0',
     flags     SMALLINT UNSIGNED NOT NULL default '0',
+    arg       TEXT,
     PRIMARY KEY (fid, type),
     INDEX type_nexttry (type,nexttry)
     )"
@@ -709,6 +717,8 @@ sub upgrade_add_device_asof { 1 }
 sub upgrade_add_device_weight { 1 }
 sub upgrade_add_device_readonly { 1 }
 sub upgrade_add_device_drain { die "Not implemented in $_[0]" }
+sub upgrade_modify_server_settings_value { die "Not implemented in $_[0]" }
+sub upgrade_add_file_to_queue_arg { die "Not implemented in $_[0]" }
 
 sub upgrade_add_class_replpolicy {
     my ($self) = @_;
@@ -1273,8 +1283,14 @@ sub enqueue_for_todo {
     my $nexttry = $self->unix_timestamp . " + " . int($in);
 
     $self->retry_on_deadlock(sub {
-        $self->insert_ignore("INTO file_to_queue (fid, type, nexttry) ".
-                             "VALUES (?,?,$nexttry)", undef, $fidid, $type);
+        if (ref($fidid)) {
+            $self->insert_ignore("INTO file_to_queue (fid, devid, arg, type, ".
+                                 "nexttry) VALUES (?,?,?,?,$nexttry)", undef,
+                                 $fidid->[0], $fidid->[1], $fidid->[2], $type);
+        } else {
+            $self->insert_ignore("INTO file_to_queue (fid, type, nexttry) ".
+                                 "VALUES (?,?,$nexttry)", undef, $fidid, $type);
+        }
     });
 }
 
@@ -1282,7 +1298,7 @@ sub enqueue_for_todo {
 sub enqueue_many_for_todo {
     my ($self, $fidids, $type, $in) = @_;
     if (@$fidids > 1 && ! ($self->can_insert_multi && ($self->can_replace || $self->can_insertignore))) {
-        $self->enqueue_for_todo($_->{fid}, $type, $in) foreach @$fidids;
+        $self->enqueue_for_todo($_, $type, $in) foreach @$fidids;
         return 1;
     }
 
@@ -1291,9 +1307,16 @@ sub enqueue_many_for_todo {
 
     # TODO: convert to prepared statement?
     $self->retry_on_deadlock(sub {
-        $self->dbh->do($self->ignore_replace . " INTO file_to_queue (fid, type,
-        nexttry) VALUES " .
-        join(",", map { "(" . int($_->{fid}) . ", $type, $nexttry)" } @$fidids));
+        if (ref($fidids->[0]) eq 'ARRAY') {
+            my $sql =  $self->ignore_replace .
+                "INTO file_to_queue (fid, devid, arg, type, nexttry) VALUES ".
+                join(', ', ('(?,?,?,?,?)') x scalar @$fidids);
+            $self->dbh->do($sql, undef, map { @$_, $type, $nexttry } @$fidids);
+        } else {
+            $self->dbh->do($self->ignore_replace . " INTO file_to_queue (fid, type,
+            nexttry) VALUES " .
+            join(",", map { "(" . int($_->{fid}) . ", $type, $nexttry)" } @$fidids));
+        }
     });
     $self->condthrow;
 }
@@ -1329,6 +1352,43 @@ sub get_fidids_by_device {
     return $fidids;
 }
 
+# finds a chunk of fids given a set of constraints:
+# devid, fidid, age (new or old), limit
+# Note that if this function is very slow on your large DB, you're likely
+# sorting by "newfiles" and are missing a new index.
+# returns an arrayref of fidids
+sub get_fidid_chunks_by_device {
+    my ($self, %o) = @_;
+
+    my $dbh = $self->dbh;
+    my $devid = delete $o{devid};
+    croak("must supply at least a devid") unless $devid;
+    my $age   = delete $o{age};
+    my $fidid = delete $o{fidid};
+    my $limit = delete $o{limit};
+    croak("invalid options: " . join(', ', keys %o)) if %o;
+    # If supplied a "previous" fidid, we're paging through.
+    my $fidsort = '';
+    my $order   = '';
+    $age ||= 'old';
+    if ($age eq 'old') {
+        $fidsort = 'AND fid > ?' if $fidid;
+        $order   = 'ASC';
+    } elsif ($age eq 'new') {
+        $fidsort = 'AND fid < ?' if $fidid;
+        $order   = 'DESC';
+    } else {
+        croak("invalid age argument: " . $age);
+    }
+    $limit ||= 100;
+    my @extra = ();
+    push @extra, $fidid if $fidid;
+
+    my $fidids = $dbh->selectcol_arrayref("SELECT fid FROM file_on WHERE devid = ? " .
+        $fidsort . " ORDER BY fid $order LIMIT $limit", undef, $devid, @extra);
+    return $fidids;
+}
+
 # takes two arguments, fidid to be above, and optional limit (default
 # 1,000).  returns up to that that many fidids above the provided
 # fidid.  returns array of MogileFS::FID objects, sorted by fid ids.
@@ -1351,22 +1411,15 @@ sub get_fids_above_id {
 }
 
 # Same as above, but returns unblessed hashref.
-sub get_fid_hrefs_above_id {
+sub get_fidids_above_id {
     my ($self, $fidid, $limit) = @_;
     $limit ||= 1000;
     $limit = int($limit);
 
-    my @ret;
     my $dbh = $self->dbh;
-    my $sth = $dbh->prepare("SELECT fid, dmid, dkey, length, classid ".
-                            "FROM   file ".
-                            "WHERE  fid > ? ".
-                            "ORDER BY fid LIMIT $limit");
-    $sth->execute($fidid);
-    while (my $row = $sth->fetchrow_hashref) {
-        push @ret, $row;
-    }
-    return @ret;
+    my $fidids = $dbh->selectcol_arrayref(qq{SELECT fid FROM file WHERE fid > ?
+                     ORDER BY fid LIMIT $limit});
+    return $fidids;
 }
 
 # creates a new domain, given a domain namespace string.  return the dmid on success,
@@ -1494,9 +1547,10 @@ sub grab_files_to_delete2 {
 
 # $extwhere is ugly... but should be fine.
 sub grab_files_to_queued {
-    my ($self, $type, $limit) = @_;
+    my ($self, $type, $what, $limit) = @_;
+    $what ||= 'type, flags';
     return $self->grab_queue_chunk('file_to_queue', $limit,
-        'type, flags', 'AND type = ' . $type);
+        $what, 'AND type = ' . $type);
 }
 
 # although it's safe to have multiple tracker hosts and/or processes
@@ -1532,9 +1586,10 @@ sub delete_fid_from_file_to_replicate {
 }
 
 sub delete_fid_from_file_to_queue {
-    my ($self, $fidid) = @_;
+    my ($self, $fidid, $type) = @_;
     $self->retry_on_deadlock(sub {
-        $self->dbh->do("DELETE FROM file_to_queue WHERE fid=?", undef, $fidid);
+        $self->dbh->do("DELETE FROM file_to_queue WHERE fid=? and type=?",
+            undef, $fidid, $type);
     });
 }
 
@@ -1836,19 +1891,6 @@ sub random_fids_on_device {
 
     @some_fids = @some_fids[0..$limit-1] if $limit < @some_fids;
     return @some_fids;
-}
-
-# return array of { dmid => ..., classid => ..., devcount => ..., count => ... }
-sub get_stats_files_per_devcount {
-    my ($self) = @_;
-    my $dbh = $self->dbh;
-    my @ret;
-    my $sth = $dbh->prepare('SELECT dmid, classid, devcount, COUNT(devcount) AS "count" FROM file GROUP BY 1, 2, 3');
-    $sth->execute;
-    while (my $row = $sth->fetchrow_hashref) {
-        push @ret, $row;
-    }
-    return @ret;
 }
 
 1;

@@ -290,6 +290,20 @@ sub upgrade_add_device_drain {
     }
 }
 
+sub upgrade_modify_server_settings_value {
+    my $self = shift;
+    unless ($self->column_type("server_settings", "value" =~ /text/i)) {
+        $self->dowell("ALTER TABLE server_settings MODIFY COLUMN value TEXT");
+    }
+}
+
+sub upgrade_add_file_to_queue_arg {
+    my $self = shift;
+    unless ($self->column_type("file_to_queue", "arg")) {
+        $self->dowell("ALTER TABLE file_to_queue ADD COLUMN arg TEXT");
+    }
+}
+
 # return 1 on success.  die otherwise.
 sub enqueue_fids_to_delete {
     my ($self, @fidids) = @_;
@@ -746,23 +760,6 @@ sub release_lock {
     $self->condthrow;
     $self->{lock_depth} = 0;
     return $rv;
-}
-
-# return array of { dmid => ..., classid => ..., devcount => ..., count => ... }
-sub get_stats_files_per_devcount {
-    my ($self) = @_;
-    my $dbh = $self->dbh;
-    my @ret;
-    my $sth = $dbh->prepare('SELECT dmid, classid, t1.devcount, COUNT(t1.devcount) AS "count" '.
-                            'FROM file JOIN ('.
-                            'SELECT fid, COUNT(devid) AS devcount FROM file_on GROUP BY fid'.
-                            ') t1 USING (fid) '.
-                            'GROUP BY 1, 2, 3');
-    $sth->execute;
-    while (my $row = $sth->fetchrow_hashref) {
-        push @ret, $row;
-    }
-    return @ret;
 }
 
 1;

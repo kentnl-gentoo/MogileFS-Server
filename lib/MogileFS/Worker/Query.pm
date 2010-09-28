@@ -9,6 +9,7 @@ use fields qw(querystarttime reqid);
 use MogileFS::Util qw(error error_code first weighted_list
                       device_state eurl decode_url_args);
 use MogileFS::HTTPFile;
+use MogileFS::Rebalance;
 
 sub new {
     my ($class, $psock) = @_;
@@ -1211,123 +1212,6 @@ sub cmd_set_state {
     return $self->ok_line;
 }
 
-# FIXME: this whole thing is gross, duplicative, dependent on $dbh, and doesn't scale.
-# stats needs total overhaul to not suck.
-sub cmd_stats {
-    my MogileFS::Worker::Query $self = shift;
-    my $args = shift;
-
-    # get database handle
-    my $ret = {};
-    my $sto = Mgd::get_store();
-    my $dbh = Mgd::get_dbh()
-        or return $self->err_line('nodb');
-
-    # get names of all domains and classes for use later
-    my %classes;
-    my $rows;
-
-    $rows = $dbh->selectall_arrayref('SELECT d.dmid, d.namespace, c.classid, c.classname ' .
-                                     'FROM domain d LEFT JOIN class c ON c.dmid=d.dmid');
-
-    foreach my $row (@$rows) {
-        $classes{$row->[0]}->{name} = $row->[1];
-        $classes{$row->[0]}->{classes}->{$row->[2] || 0} = $row->[3] || 'default';
-    }
-    $classes{$_}->{classes}->{0} = 'default'
-        foreach keys %classes;
-
-    # get host and device information with device status
-    my %devices;
-    $rows = $dbh->selectall_arrayref('SELECT device.devid, hostname, device.status ' .
-                                     'FROM device, host WHERE device.hostid = host.hostid');
-    foreach my $row (@$rows) {
-        $devices{$row->[0]}->{host} = $row->[1];
-        $devices{$row->[0]}->{status} = $row->[2];
-    }
-
-    # if they want replication counts, or didn't specify what they wanted
-    if ($args->{replication} || $args->{all}) {
-        # replication stats
-        # This is the old version that used devcount:
-        my @stats = $sto->get_stats_files_per_devcount;
-
-        my $count = 0;
-        foreach my $stat (@stats) {
-            $count++;
-            $ret->{"replication${count}domain"} = $classes{$stat->{dmid}}->{name};
-            $ret->{"replication${count}class"} = $classes{$stat->{dmid}}->{classes}->{$stat->{classid}};
-            $ret->{"replication${count}devcount"} = $stat->{devcount};
-            $ret->{"replication${count}files"} = $stat->{count};
-        }
-        $ret->{"replicationcount"} = $count;
-
-        # now we want to do the "new" replication stats
-        my $db_time = $dbh->selectrow_array('SELECT '.$sto->unix_timestamp);
-        my $stats = $dbh->selectall_arrayref('SELECT nexttry, COUNT(*) FROM file_to_replicate GROUP BY 1');
-        foreach my $stat (@$stats) {
-            if ($stat->[0] < 1000) {
-                # anything under 1000 is a specific state, so let's define those.  here's the list
-                # of short names to describe them.
-                my $name = {
-                    0 => 'newfile', # new files that need to be replicated
-                    1 => 'redo',    # files that need to go through replication again
-                }->{$stat->[0]} || "unknown";
-
-                # now put it in the output hashref.  note that we do += because we might
-                # have more than one group of unknowns.
-                $ret->{"to_replicate_$name"} += $stat->[1];
-
-            } elsif ($stat->[0] == MogileFS::Worker::Replicate::end_of_time()) {
-                $ret->{"to_replicate_manually"} = $stat->[1];
-
-            } elsif ($stat->[0] < $db_time) {
-                $ret->{"to_replicate_overdue"} += $stat->[1];
-
-            } else {
-                $ret->{"to_replicate_deferred"} += $stat->[1];
-            }
-        }
-    }
-
-    # file statistics (how many files there are and in what domains/classes)
-    if ($args->{files} || $args->{all}) {
-        my $stats = $dbh->selectall_arrayref('SELECT dmid, classid, COUNT(classid) FROM file GROUP BY 1, 2');
-        my $count = 0;
-        foreach my $stat (@$stats) {
-            $count++;
-            $ret->{"files${count}domain"} = $classes{$stat->[0]}->{name};
-            $ret->{"files${count}class"} = $classes{$stat->[0]}->{classes}->{$stat->[1]};
-            $ret->{"files${count}files"} = $stat->[2];
-        }
-        $ret->{"filescount"} = $count;
-    }
-
-    # device statistics (how many files are on each device)
-    if ($args->{devices} || $args->{all}) {
-        my $stats = $dbh->selectall_arrayref('SELECT devid, COUNT(devid) FROM file_on GROUP BY 1');
-        my $count = 0;
-        foreach my $stat (@$stats) {
-            $count++;
-            $ret->{"devices${count}id"} = $stat->[0];
-            $ret->{"devices${count}host"} = $devices{$stat->[0]}->{host};
-            $ret->{"devices${count}status"} = $devices{$stat->[0]}->{status};
-            $ret->{"devices${count}files"} = $stat->[1];
-        }
-        $ret->{"devicescount"} = $count;
-    }
-
-    # now fid statistics
-    if ($args->{fids} || $args->{all}) {
-        my $max = $dbh->selectrow_array('SELECT MAX(fid) FROM file');
-        $ret->{"fidmax"} = $max;
-    }
-
-    # FIXME: DO! add other stats
-
-    return $self->ok_line($ret);
-}
-
 sub cmd_noop {
     my MogileFS::Worker::Query $self = shift;
     my $args = shift;
@@ -1417,6 +1301,12 @@ sub cmd_do_monitor_round {
 sub cmd_fsck_start {
     my MogileFS::Worker::Query $self = shift;
     my $sto = Mgd::get_store();
+
+    my $fsck_host  = MogileFS::Config->server_setting("fsck_host");
+    my $rebal_host = MogileFS::Config->server_setting("rebal_host");
+
+    return $self->err_line("fsck_running", "fsck is already running") if $fsck_host;
+    return $self->err_line("rebal_running", "rebalance running; cannot run fsck at same time") if $rebal_host;
 
     # reset position, if a previous fsck was already completed.
     my $intss       = sub { MogileFS::Config->server_setting($_[0]) || 0 };
@@ -1537,6 +1427,108 @@ sub cmd_fsck_status {
     return $self->ok_line($ret);
 }
 
+sub cmd_rebalance_status {
+    my MogileFS::Worker::Query $self = shift;
+
+    my $sto = Mgd::get_store();
+
+    my $rebal_state = MogileFS::Config->server_setting('rebal_state');
+    return $self->err_line('no_rebal_state') unless $rebal_state;
+    return $self->ok_line({ state => $rebal_state });
+}
+
+sub cmd_rebalance_start {
+    my MogileFS::Worker::Query $self = shift;
+
+    my $rebal_host = MogileFS::Config->server_setting("rebal_host");
+    my $fsck_host  = MogileFS::Config->server_setting("fsck_host");
+
+    return $self->err_line("rebal_running", "rebalance is already running") if $rebal_host;
+    return $self->err_line("fsck_running", "fsck running; cannot run rebalance at same time") if $fsck_host;
+
+    my $rebal_state = MogileFS::Config->server_setting('rebal_state');
+    unless ($rebal_state) {
+        my $rebal_pol = MogileFS::Config->server_setting('rebal_policy');
+        return $self->err_line('no_rebal_policy') unless $rebal_pol;
+
+        my $rebal = MogileFS::Rebalance->new;
+        $rebal->policy($rebal_pol);
+        my @devs  = MogileFS::Device->devices;
+        $rebal->init(\@devs);
+        my $sdevs = $rebal->source_devices;
+
+        $rebal_state = $rebal->save_state;
+        MogileFS::Config->set_server_setting('rebal_state', $rebal_state);
+    }
+    # TODO: register start time somewhere.
+    MogileFS::Config->set_server_setting('rebal_host', MogileFS::Config->hostname);
+    return $self->ok_line({ state => $rebal_state });
+}
+
+sub cmd_rebalance_test {
+    my MogileFS::Worker::Query $self = shift;
+    my $rebal_pol   = MogileFS::Config->server_setting('rebal_policy');
+    my $rebal_state = MogileFS::Config->server_setting('rebal_state');
+    return $self->err_line('no_rebal_policy') unless $rebal_pol;
+
+    my $rebal = MogileFS::Rebalance->new;
+    my @devs  = MogileFS::Device->devices;
+    $rebal->policy($rebal_pol);
+    $rebal->init(\@devs);
+
+    # client should display list of source, destination devices.
+    # FIXME: can probably avoid calling this twice by pulling state?
+    # *or* not running init.
+    my $sdevs = $rebal->filter_source_devices(\@devs);
+    my $ddevs = $rebal->filter_dest_devices(\@devs);
+    my $ret   = {};
+    $ret->{sdevs} = join(',', @$sdevs);
+    $ret->{ddevs} = join(',', @$ddevs);
+
+    return $self->ok_line($ret);
+}
+
+sub cmd_rebalance_reset {
+    my MogileFS::Worker::Query $self = shift;
+    my $host = MogileFS::Config->server_setting('rebal_host');
+    if ($host) {
+        return $self->err_line("rebal_running", "rebalance is running") if $host;
+    }
+    MogileFS::Config->set_server_setting('rebal_state', undef);
+    return $self->ok_line;
+}
+
+sub cmd_rebalance_stop {
+    my MogileFS::Worker::Query $self = shift;
+    my $host = MogileFS::Config->server_setting('rebal_host');
+    unless ($host) {
+        return $self->err_line('rebal_not_started');
+    }
+    MogileFS::Config->set_server_setting('rebal_signal', 'stop');
+    return $self->ok_line;
+}
+
+sub cmd_rebalance_set_policy {
+    my MogileFS::Worker::Query $self = shift;
+    my $args = shift;
+
+    my $rebal_host = MogileFS::Config->server_setting("rebal_host");
+    return $self->err_line("no_set_rebal", "cannot change rebalance policy while rebalance is running") if $rebal_host;
+
+    # load policy object, test policy, set policy.
+    my $rebal = MogileFS::Rebalance->new;
+    eval {
+        $rebal->policy($args->{policy});
+    };
+    if ($@) {
+        return $self->err_line("bad_rebal_pol", $@);
+    }
+
+    MogileFS::Config->set_server_setting('rebal_policy', $args->{policy});
+    MogileFS::Config->set_server_setting('rebal_state', undef);
+    return $self->ok_line;
+}
+
 sub ok_line {
     my MogileFS::Worker::Query $self = shift;
 
@@ -1595,6 +1587,9 @@ sub err_line {
         'unknown_host' => "Host not found",
         'unknown_state' => "Invalid/unknown state",
         'unreg_domain' => "Domain name invalid/not found",
+        'rebal_not_started' => "Rebalance not running",
+        'no_rebal_state' => "No available rebalance status",
+        'no_rebal_policy' => "No rebalance policy available",
     }->{$err_code} || $err_code;
 
     my $delay = '';
