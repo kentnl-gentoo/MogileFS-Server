@@ -51,6 +51,7 @@ my %default_state = (
     sdev_current => 0,
     sdev_lastfid => 0,
     sdev_limit => 0,
+    limit => 0,
     fids_queued => 0,
     bytes_queued => 0,
     time_started => 0,
@@ -429,7 +430,7 @@ sub filter_dest_devices {
     # FIXME: ends up not skipping stuff out of completed_devs? :/
     my %sdevs = map { $_ => 1 } @{$state->{source_devs}},
         @{$state->{completed_devs}}, $state->{sdev_current};
-    my @devs  = grep { ! $sdevs{$_} } @$devs;
+    my @devs  = grep { ! $sdevs{$_->id} } @$devs;
 
     my @ddevs = ();
     for my $dev (@devs) {
