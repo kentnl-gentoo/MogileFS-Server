@@ -10,6 +10,7 @@ use MogileFS::Util qw(error error_code first weighted_list
                       device_state eurl decode_url_args);
 use MogileFS::HTTPFile;
 use MogileFS::Rebalance;
+use MogileFS::Config;
 
 sub new {
     my ($class, $psock) = @_;
@@ -368,15 +369,45 @@ sub cmd_create_close {
 
     # find the temp file we're closing and making real.  If another worker
     # already has it, bail out---the client closed it twice.
+    # this is racy, but the only expected use case is a client retrying.
+    # should still be fixed better once more scalable locking is available.
     my $trow = $sto->delete_and_return_tempfile_row($fidid) or
         return $self->err_line("no_temp_file");
+
+    # Protect against leaving orphaned uploads.
+    my $failed = sub {
+        $dfid->add_to_db;
+        $fid->delete;
+    };
+
+    unless ($trow->{devids} =~ m/\b$devid\b/) {
+        $failed->();
+        return $self->err_line("invalid_destdev", "File uploaded to invalid dest $devid. Valid devices were: " . $trow->{devids});
+    }
 
     # if a temp file is closed without a provided-key, that means to
     # delete it.
     unless (defined $key && length($key)) {
-        $dfid->add_to_db;
-        $fid->delete;
+        $failed->();
         return $self->ok_line;
+    }
+
+    # get size of file and verify that it matches what we were given, if anything
+    my $size = MogileFS::HTTPFile->at($path)->size;
+
+    # size check is optional? Needs to support zero byte files.
+    $args->{size} = -1 unless $args->{size};
+    if (!defined($size) || $size == MogileFS::HTTPFile::FILE_MISSING) {
+        # storage node is unreachable or the file is missing
+        my $type    = defined $size ? "missing" : "cantreach";
+        my $lasterr = MogileFS::Util::last_error();
+        $failed->();
+        return $self->err_line("size_verify_error", "Expected: $args->{size}; actual: 0 ($type); path: $path; error: $lasterr")
+    }
+
+    if ($args->{size} > -1 && ($args->{size} != $size)) {
+        $failed->();
+        return $self->err_line("size_mismatch", "Expected: $args->{size}; actual: $size; path: $path")
     }
 
     # see if we have a fid for this key already
@@ -389,21 +420,6 @@ sub cmd_create_close {
 
         $old_fid->delete;
     }
-
-    # get size of file and verify that it matches what we were given, if anything
-    my $size = MogileFS::HTTPFile->at($path)->size;
-
-    # size check is optional? Needs to support zero byte files.
-    $args->{size} = -1 unless $args->{size};
-    if (!defined($size) || $size == MogileFS::HTTPFile::FILE_MISSING) {
-        # storage node is unreachable or the file is missing
-        my $type    = defined $size ? "missing" : "cantreach";
-        my $lasterr = MogileFS::Util::last_error();
-        return $self->err_line("size_verify_error", "Expected: $args->{size}; actual: 0 ($type); path: $path; error: $lasterr")
-    }
-
-    return $self->err_line("size_mismatch", "Expected: $args->{size}; actual: $size; path: $path")
-        if $args->{size} > -1 && ($args->{size} != $size);
 
     # TODO: check for EIO?
 
@@ -491,19 +507,113 @@ sub cmd_delete {
     return $self->ok_line;
 }
 
+# Takes either domain/dkey or fid and tries to return as much as possible.
+sub cmd_file_debug {
+    my MogileFS::Worker::Query $self = shift;
+    my $args = shift;
+    # Talk to the master since this is "debug mode"
+    my $sto = Mgd::get_store();
+    my $ret = {};
+
+    # If a FID is provided, just use that.
+    my $fid;
+    my $fidid;
+    if ($args->{fid}) {
+        $fidid = $args->{fid}+0;
+        # It's not fatal if we don't find the row here.
+        $fid = $sto->file_row_from_fidid($args->{fid}+0);
+    } else {
+        # If not, require dmid/dkey and pick up the fid from there.
+        $args->{dmid} = $self->check_domain($args)
+            or return $self->err_line('domain_not_found');
+        return $self->err_line("no_key") unless $args->{key};
+        $fid = $sto->file_row_from_dmid_key($args->{dmid}, $args->{key});
+        return $self->err_line("unknown_key") unless $fid;
+        $fidid = $fid->{fid};
+    }
+
+    if ($fid) {
+        $fid->{domain}   = MogileFS::Domain->name_of_id($fid->{dmid});
+        $fid->{class}    = MogileFS::Class->class_name($fid->{dmid},
+            $fid->{classid});
+    }
+
+    # Fetch all of the queue data.
+    my $tfile = $sto->tempfile_row_from_fid($fidid);
+    my $repl  = $sto->find_fid_from_file_to_replicate($fidid);
+    my $del   = $sto->find_fid_from_file_to_delete2($fidid);
+    my $reb   = $sto->find_fid_from_file_to_queue($fidid, REBAL_QUEUE);
+    my $fsck  = $sto->find_fid_from_file_to_queue($fidid, FSCK_QUEUE);
+
+    # Fetch file_on rows, and turn into paths.
+    my @devids = $sto->fid_devids($fidid);
+    for my $devid (@devids) {
+        # Won't matter if we can't make the path (dev is dead/deleted/etc)
+        eval {
+            my $dfid = MogileFS::DevFID->new($devid, $fidid);
+            my $path = $dfid->get_url;
+            $ret->{'devpath_' . $devid} = $path;
+        };
+    }
+    $ret->{devids} = join(',', @devids) if @devids;
+
+    # Return file row (if found) and all other data.
+    my %toret = (fid => $fid, tempfile => $tfile, replqueue => $repl,
+        delqueue => $del, rebqueue => $reb, fsckqueue => $fsck);
+    while (my ($key, $hash) = each %toret) {
+        while (my ($name, $val) = each %$hash) {
+            $ret->{$key . '_' . $name} = $val;
+        }
+    }
+
+    return $self->err_line("unknown_fid") unless keys %$ret;
+    return $self->ok_line($ret);
+}
+
+sub cmd_file_info {
+    my MogileFS::Worker::Query $self = shift;
+    my $args = shift;
+
+    $args->{dmid} = $self->check_domain($args)
+        or return $self->err_line('domain_not_found');
+
+    # validate parameters
+    my $dmid = $args->{dmid};
+    my $key = $args->{key} or return $self->err_line("no_key");
+
+    my $fid;
+    Mgd::get_store()->slaves_ok(sub {
+        $fid = MogileFS::FID->new_from_dmid_and_key($dmid, $key);
+    });
+    $fid or return $self->err_line("unknown_key");
+
+    my $ret = {};
+    $ret->{fid}      = $fid->id;
+    $ret->{domain}   = MogileFS::Domain->name_of_id($fid->dmid);
+    $ret->{class}    = MogileFS::Class->class_name($fid->dmid, $fid->classid);
+    $ret->{key}      = $key;
+    $ret->{'length'} = $fid->length;
+    $ret->{devcount} = $fid->devcount;
+    # Only if requested, also return the raw devids.
+    # Caller should use get_paths if they intend to fetch the file.
+    if ($args->{devices}) {
+        $ret->{devids} = join(',', $fid->devids);
+    }
+
+    return $self->ok_line($ret);
+}
+
 sub cmd_list_fids {
     my MogileFS::Worker::Query $self = shift;
     my $args = shift;
 
     # validate parameters
     my $fromfid = ($args->{from} || 0)+0;
-    my $tofid = ($args->{to} || 0)+0;
-    $tofid ||= ($fromfid + 100);
-    $tofid = ($fromfid + 100)
-        if $tofid > $fromfid + 100 ||
-           $tofid < $fromfid;
+    my $count = ($args->{to} || 0)+0;
+    $count ||= 100;
+    $count = 500 if $count > 500 || $count < 0;
 
-    my $rows = Mgd::get_store()->file_row_from_fidid_range($fromfid, $tofid);
+    my $rows = Mgd::get_store()->file_row_from_fidid_range($fromfid, $count);
     return $self->err_line('failure') unless $rows;
     return $self->ok_line({ fid_count => 0 }) unless @$rows;
 

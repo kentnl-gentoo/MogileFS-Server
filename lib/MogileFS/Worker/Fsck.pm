@@ -89,6 +89,8 @@ sub work {
         my $queue_todo = $self->queue_todo('fsck');
         # This counts the same as a $self->still_alive;
         $self->send_to_parent('worker_bored 50 fsck');
+        return unless @{$queue_todo};
+        $self->validate_dbh;
 
         my @fids = ();
         while (my $todo = shift @{$queue_todo}) {
@@ -296,7 +298,7 @@ sub fix_fid {
             # don't log in desperate mode, as we'd have "file missing!" log entries
             # for every device in the normal case, which is expected.
             unless ($is_desperate_mode) {
-                if (! $disk_size) {
+                if ($disk_size == -1) {
                     $fid->fsck_log(EV_FILE_MISSING, $dev);
                 } else {
                     $fid->fsck_log(EV_BAD_LENGTH, $dev);

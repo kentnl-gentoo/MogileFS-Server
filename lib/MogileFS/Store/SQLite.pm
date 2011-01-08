@@ -30,6 +30,7 @@ sub dsn_of_root {
 
 sub can_replace { 1 }
 sub can_insertignore { 0 }
+sub can_for_update { 0 }
 sub unix_timestamp { "strftime('%s','now')" }
 
 # DBD::SQLite doesn't really have any table meta info methods
@@ -76,6 +77,7 @@ sub was_duplicate_error {
 
 sub new_temp {
     my ($fh, $filename) = File::Temp::tempfile();
+    close($fh);
 
     system("$FindBin::Bin/../mogdbsetup", "--type=SQLite", "--yes", "--dbname=$filename")
         and die "Failed to run mogdbsetup ($FindBin::Bin/../mogdbsetup).";

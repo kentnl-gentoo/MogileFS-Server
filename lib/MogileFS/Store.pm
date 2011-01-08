@@ -52,6 +52,8 @@ sub new_from_dsn_user_pass {
         slave_list_cache     => [],
         recheck_req_gen  => 0,  # incremented generation, of recheck of dbh being requested
         recheck_done_gen => 0,  # once recheck is done, copy of what the request generation was
+        recheck_after    => 60, # ->ping at most once per minute.
+        last_used        => 0,  # how stale is the handle?
         handles_left     => 0,  # amount of times this handle can still be verified
         server_setting_cache => {}, # value-agnostic db setting cache.
     }, $subclass;
@@ -124,6 +126,7 @@ sub grant_privileges {
 sub can_replace      { 0 }
 sub can_insertignore { 0 }
 sub can_insert_multi { 0 }
+sub can_for_update   { 1 }
 
 sub unix_timestamp { die "No function in $_[0] to return DB's unixtime." }
 
@@ -263,16 +266,22 @@ sub recheck_dbh {
 
 sub dbh {
     my $self = shift;
+    my $now  = time();
     
     if ($self->{dbh}) {
-        if ($self->{recheck_done_gen} != $self->{recheck_req_gen}) {
+        if ($self->{last_used} < $now - $self->{recheck_after}) {
             $self->{dbh} = undef unless $self->{dbh}->ping;
+        }
+        if ($self->{recheck_done_gen} != $self->{recheck_req_gen}) {
             # Handles a memory leak under Solaris/Postgres.
             $self->{dbh} = undef if ($self->{max_handles} &&
                 $self->{handles_left}-- < 0);
             $self->{recheck_done_gen} = $self->{recheck_req_gen};
         }
-        return $self->{dbh} if $self->{dbh};
+        if ($self->{dbh}) {
+            $self->{last_used} = $now;
+            return $self->{dbh};
+        }
     }
 
     $self->{dbh} = DBI->connect($self->{dsn}, $self->{user}, $self->{pass}, {
@@ -284,6 +293,7 @@ sub dbh {
         die "Failed to connect to database: " . DBI->errstr;
     $self->post_dbi_connect;
     $self->{handles_left} = $self->{max_handles} if $self->{max_handles};
+    $self->{last_used}    = $now;
     return $self->{dbh};
 }
 
@@ -380,9 +390,7 @@ sub retry_on_deadlock {
     while ($tries-- > 0) {
         $rv = eval { $code->(); };
         next if ($self->was_deadlock_error);
-        if ($@) {
-            croak($@) unless $self->dbh->err;
-        }
+        croak($@) if $@;
         last;
     }
     return $rv;
@@ -996,10 +1004,10 @@ sub file_row_from_fidid {
 # return an arrayref of rows containing columns "fid, dmid, dkey, length,
 # classid, devcount" provided a pair of $fidid or undef if no rows.
 sub file_row_from_fidid_range {
-    my ($self, $fromfid, $tofid) = @_;
+    my ($self, $fromfid, $count) = @_;
     my $sth = $self->dbh->prepare("SELECT fid, dmid, dkey, length, classid, devcount ".
-                                  "FROM file WHERE fid BETWEEN ? AND ?");
-    $sth->execute($fromfid,$tofid);
+                                  "FROM file WHERE fid > ? LIMIT ?");
+    $sth->execute($fromfid,$count);
     return $sth->fetchall_arrayref({});
 }
 
@@ -1026,7 +1034,7 @@ sub fid_devids_multiple {
 # return hashref of columns classid, dmid, dkey, given a $fidid, or return undef
 sub tempfile_row_from_fid {
     my ($self, $fidid) = @_;
-    return $self->dbh->selectrow_hashref("SELECT classid, dmid, dkey ".
+    return $self->dbh->selectrow_hashref("SELECT classid, dmid, dkey, devids ".
                                          "FROM tempfile WHERE fid=?",
                                          undef, $fidid);
 }
@@ -1506,15 +1514,16 @@ sub grab_queue_chunk {
     eval {
         $dbh->begin_work;
         my $ut  = $self->unix_timestamp;
-        my $sth = $dbh->prepare(qq{
+        my $query = qq{
             SELECT $fields
             FROM $queue
             WHERE nexttry <= $ut
             $extwhere
             ORDER BY nexttry
             LIMIT $limit
-            FOR UPDATE
-        });
+        };
+        $query .= "FOR UPDATE\n" if $self->can_for_update;
+        my $sth = $dbh->prepare($query);
         $sth->execute;
         $work = $sth->fetchall_hashref('fid');
         # Nothing to work on.
@@ -1576,6 +1585,24 @@ sub should_begin_replicating_fidid {
 # locking in this pair of functions.
 sub note_done_replicating {
     my ($self, $fidid) = @_;
+}
+
+sub find_fid_from_file_to_replicate {
+    my ($self, $fidid) = @_;
+    return $self->dbh->selectrow_hashref("SELECT fid, nexttry, fromdevid, failcount, flags FROM file_to_replicate WHERE fid = ?",
+        undef, $fidid); 
+}
+
+sub find_fid_from_file_to_delete2 {
+    my ($self, $fidid) = @_;
+    return $self->dbh->selectrow_hashref("SELECT fid, nexttry, failcount FROM file_to_delete2 WHERE fid = ?",
+        undef, $fidid);
+}
+
+sub find_fid_from_file_to_queue {
+    my ($self, $fidid, $type) = @_;
+    return $self->dbh->selectrow_hashref("SELECT fid, devid, type, nexttry, failcount, flags, arg FROM file_to_queue WHERE fid = ? AND type = ?",
+        undef, $fidid, $type);
 }
 
 sub delete_fid_from_file_to_replicate {

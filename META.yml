@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               MogileFS-Server
-version:            2.44
+version:            2.45
 abstract:           MogileFS (distributed filesystem) server
 author:
     - Brad Fitzpatrick <brad@danga.com>
@@ -23,10 +23,10 @@ requires:
     Sys::Syscall:      0.22
     Sys::Syslog:       0
 resources:
-    bugtracker:   http://rt.cpan.org/Public/Dist/Display.html?Name=mogilefs-server
-    homepage:     http://danga.com/mogilefs/
+    bugtracker:   http://code.google.com/p/mogilefs/issues/list
+    homepage:     http://www.mogilefs.org
     MailingList:  http://groups.google.com/group/mogile
-    repository:   http://code.sixapart.com/svn/mogilefs/
+    repository:   git://github.com/mogilefs/MogileFS-Server.git
 no_index:
     directory:
         - t
