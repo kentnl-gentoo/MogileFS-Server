@@ -6,6 +6,7 @@ BINARY="/usr/bin/mogstored"
 depend() {
 	use net
 	before mogilefsd
+	need mogautomount
 }
 
 start() {
