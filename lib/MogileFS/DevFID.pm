@@ -25,7 +25,7 @@ sub as_string {
 
 sub device {
     my $self = shift;
-    return $self->{dev} ||= MogileFS::Device->of_devid($self->{devid});
+    return $self->{dev} ||= Mgd::device_factory()->get_by_id($self->{devid});
 }
 
 sub fid {
@@ -53,7 +53,7 @@ sub get_url {
 sub vivify_directories {
     my $self = shift;
     my $url = $self->url;
-    MogileFS::Device->vivify_directories($url);
+    $self->device()->vivify_directories($url);
 }
 
 # returns 0 on missing,
@@ -105,7 +105,6 @@ sub _make_full_url {
     # get some information we'll need
     my $dev  = $self->device   or return undef;
     my $host = $dev->host      or return undef;
-    return undef unless $host->exists;
 
     my $path   = $self->uri_path;
     my $hostip = $host->ip;

@@ -34,7 +34,7 @@ sub want_raise_errors { 1 }
 # if it it's made, or already exists.  die otherwise.
 sub create_db_if_not_exists {
     my ($pkg, $rdbh, $dbname) = @_;
-    if(not $rdbh->do("CREATE DATABASE $dbname")) {
+    if(not $rdbh->do("CREATE DATABASE $dbname TEMPLATE template0 ENCODING 'UTF-8'" )) {
         die "Failed to create database '$dbname': " . $rdbh->errstr . "\n" if ($rdbh->errstr !~ /already exists/);
     }
 }
@@ -470,26 +470,49 @@ sub fid_type {
 # --------------------------------------------------------------------------
 
 sub new_temp {
-    my $dbname = "tmp_mogiletest";
-    _drop_db($dbname);
+    my $self = shift;
+    my %args = @_;
+    my $dbname = $args{dbname} || "tmp_mogiletest";
+    my $host = $args{dbhost} || 'localhost';
+    my $port = $args{dbport} || 5432;
+    my $user = $args{dbuser} || 'mogile';
+    my $pass = $args{dbpass} || '';
+    my $rootuser = $args{dbrootuser} || $args{dbuser} || 'postgres';
+    my $rootpass = $args{dbrootpass} || $args{dbpass} || '';
+    _drop_db($dbname,$host,$port,$rootuser,$rootpass);
+   
+    my @args = ( "$FindBin::Bin/../mogdbsetup", "--yes", 
+            "--dbname=$dbname", "--type=Postgres",
+            "--dbhost=$host", "--dbport=$port",
+            "--dbuser=$user", 
+            "--dbrootuser=$rootuser", );
+    push @args, "--dbpass=$pass" unless $pass eq ''; 
+    push @args, "--dbrootpass=$rootpass" unless $rootpass eq '';
+    system(@args) 
+        and die "Failed to run mogdbsetup (".join(' ',map { "'".$_."'" } @args).").";
 
-    system("$FindBin::Bin/../mogdbsetup", "--yes", "--dbname=$dbname", "--type=Postgres", "--dbrootuser=postgres")
-        and die "Failed to run mogdbsetup ($FindBin::Bin/../mogdbsetup).";
-
-    return MogileFS::Store->new_from_dsn_user_pass("dbi:Pg:dbname=$dbname",
-                                                   "mogile",
-                                                   "");
+    return MogileFS::Store->new_from_dsn_user_pass("dbi:Pg:dbname=$dbname;host=$host;port=$port",
+                                                   $user,
+                                                   $pass);
 }
 
 my $rootdbh;
 sub _root_dbh {
-    return $rootdbh ||= DBI->connect("DBI:Pg:dbname=postgres", "postgres", "", { RaiseError => 1 })
-        or die "Couldn't connect to local PostgreSQL database as postgres";
+    my $host     = shift;
+    my $port     = shift;
+    my $rootuser = shift;
+    my $rootpass = shift;
+    return $rootdbh ||= DBI->connect("DBI:Pg:dbname=postgres;host=$host;port=$port", $rootuser, $rootpass, { RaiseError => 1 })
+        or die "Couldn't connect to local PostgreSQL database as $rootuser";
 }
 
 sub _drop_db {
     my $dbname = shift;
-    my $root_dbh = _root_dbh();
+    my $host     = shift;
+    my $port     = shift;
+    my $rootuser = shift;
+    my $rootpass = shift;
+    my $root_dbh = _root_dbh($host, $port, $rootuser, $rootpass);
     eval {
         $root_dbh->do("DROP DATABASE $dbname");
     };
@@ -717,10 +740,7 @@ sub delete_fidid {
     $self->condthrow;
     $self->dbh->do("DELETE FROM tempfile WHERE fid=?", undef, $fidid);
     $self->condthrow;
-    $self->insert_or_ignore(
-        insert => "INSERT INTO file_to_delete (fid) VALUES (?)",
-        insert_vals => [ $fidid ],
-    );
+    $self->enqueue_for_delete2($fidid, 0);
     $self->condthrow;
 }
 

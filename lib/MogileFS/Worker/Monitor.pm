@@ -10,11 +10,14 @@ use fields (
             'seen_hosts',      # IP -> 1 (reset every loop)
             'ua',              # LWP::UserAgent for checking usage files
             'iow',             # MogileFS::IOStatWatcher object
+            'prev_data',       # DB data from previous run
+            'devutil',         # Running tally of device utilization
+            'events',          # Queue of state events
             );
 
 use Danga::Socket 1.56;
 use MogileFS::Config;
-use MogileFS::Util qw(error debug);
+use MogileFS::Util qw(error debug encode_url_args);
 use MogileFS::IOStatWatcher;
 
 use constant UPDATE_DB_EVERY => 15;
@@ -27,6 +30,10 @@ sub new {
     $self->{last_db_update}  = {};
     $self->{last_test_write} = {};
     $self->{iow}             = MogileFS::IOStatWatcher->new;
+    $self->{prev_data}       = { domain => {}, class => {}, host => {},
+        device => {} };
+    $self->{devutil}         = { cur => {}, prev => {} };
+    $self->{events}          = [];
     return $self;
 }
 
@@ -49,38 +56,68 @@ sub work {
             # Lets not propagate devices that we accidentally find.
             # This does hit the DB every time a device does not exist, so
             # perhaps should add negative caching in the future.
-            my $dev = MogileFS::Device->of_devid($devid);
-            next unless $dev->exists;
+            $self->{devutil}->{cur}->{$devid} = $util;
+            my $dev = Mgd::device_factory()->get_by_id($devid);
+            next unless $dev;
             $dev->set_observed_utilization($util);
         }
     });
 
+    # We announce "monitor_just_ran" every time the device checks are run, but
+    # only if the DB has been checked inbetween.
+    my $db_monitor_ran = 0;
+
+    my $db_monitor;
+    $db_monitor = sub {
+        $self->parent_ping;
+        debug("Monitor running; checking DB for updates");
+        $self->validate_dbh;
+
+        my $db_data   = $self->grab_all_data;
+
+        # Stack diffs to ship back later
+        $self->diff_data($db_data);
+
+        $self->send_events_to_parent;
+        $db_monitor_ran++;
+        Danga::Socket->AddTimer(4, $db_monitor);
+    };
+
+    $db_monitor->();
+    $self->read_from_parent;
+
     my $main_monitor;
     $main_monitor = sub {
         $self->parent_ping;
-
-        # get db and note we're starting a run
         debug("Monitor running; scanning usage files");
         $self->validate_dbh;
 
         $self->{skip_host}  = {};  # hostid -> 1 if already noted dead.
         $self->{seen_hosts} = {}; # IP -> 1
 
-        # now iterate over devices
-        MogileFS::Device->invalidate_cache;
-        MogileFS::Host->invalidate_cache;
+        my $dev_factory = MogileFS::Factory::Device->get_factory();
 
-        foreach my $dev (MogileFS::Device->devices) {
-            next unless $dev->dstate->should_monitor;
+        my $cur_iow = {};
+        # Run check_devices to test host/devs. diff against old values.
+        for my $dev ($dev_factory->get_all) {
+            if (my $state = $self->is_iow_diff($dev)) {
+                $self->state_event('device', $dev->id, {utilization => $state});
+            }
+            $cur_iow->{$dev->id} = $self->{devutil}->{cur}->{$dev->id};
             next if $self->{skip_host}{$dev->hostid};
             $self->check_device($dev);
         }
 
-        $iow->set_hosts(keys %{$self->{seen_hosts}});
-        $self->send_to_parent(":monitor_just_ran");
+        $self->{devutil}->{prev} = $cur_iow;
+        # Set the IOWatcher hosts (once old monitor code has been disabled)
 
-        # Make sure we sleep for at least 2.5 seconds before running again.
-        # If there's a die above, the monitor will be restarted.
+        $self->send_events_to_parent;
+
+        $iow->set_hosts(keys %{$self->{seen_hosts}});
+        if ($db_monitor_ran) {
+            $self->send_to_parent(":monitor_just_ran");
+            $db_monitor_ran = 0;
+        }
         Danga::Socket->AddTimer(2.5, $main_monitor);
     };
 
@@ -89,6 +126,122 @@ sub work {
 }
 
 # --------------------------------------------------------------------------
+
+# Flattens and flips events up to the parent. Can be huge on startup!
+# Events: set type foo=bar&baz=quux
+# remove type id
+# setstate type id foo=bar&baz=quux
+# Combined: ev_mode=set&ev_type=device&foo=bar
+# ev_mode=setstate&ev_type=device&ev_id=1&foo=bar
+sub send_events_to_parent {
+    my $self = shift;
+    my @flat = ();
+    for my $ev (@{$self->{events}}) {
+        my ($mode, $type, $args) = @$ev;
+        $args->{ev_mode} = $mode;
+        $args->{ev_type} = $type;
+        push(@flat, encode_url_args($args));
+    }
+    return unless @flat;
+    $self->{events} = [];
+    # TODO: Maybe wasting too much CPU building this debug line every time...
+    debug("sending state changes " . join(' ', ':monitor_events', @flat), 2);
+    $self->send_to_parent(join(' ', ':monitor_events', @flat));
+}
+
+sub add_event {
+    push(@{$_[0]->{events}}, $_[1]);
+}
+
+sub set_event { 
+    # Allow callers to use shorthand
+    $_[3]->{ev_id} = $_[2];
+    $_[0]->add_event(['set', $_[1], $_[3]]); 
+}
+sub remove_event { $_[0]->add_event(['remove', $_[1], { ev_id => $_[2] }]); }
+sub state_event {
+    $_[3]->{ev_id} = $_[2];
+    $_[0]->add_event(['setstate', $_[1], $_[3]]);
+}
+
+sub is_iow_diff {
+    my ($self, $dev) = @_;
+    my $devid = $dev->id;
+    my $p = $self->{devutil}->{prev}->{$devid};
+    my $c = $self->{devutil}->{cur}->{$devid};
+    if ( ! defined $p || $p ne $c ) {
+        return $c;
+    }
+    return undef;
+}
+
+sub diff_data {
+    my ($self, $db_data) = @_;
+
+    my $new_data  = {};
+    my $prev_data = $self->{prev_data};
+    for my $type (keys %{$db_data}) {
+        my $d_data = $db_data->{$type};
+        my $p_data = $prev_data->{$type};
+        my $n_data = {};
+
+        for my $item (@{$d_data}) {
+            my $id = $type eq 'domain' ? $item->{dmid}
+                : $type eq 'class'     ? $item->{dmid} . '-' . $item->{classid}
+                : $type eq 'host'      ? $item->{hostid}
+                : $type eq 'device'    ? $item->{devid} : die "Unknown type";
+            my $old = delete $p_data->{$id};
+            # Special case: for devices, we don't care if mb_asof changes.
+            # FIXME: Change the grab routine (or filter there?).
+            delete $item->{mb_asof} if $type eq 'device';
+            if (!$old || $self->diff_hash($old, $item)) {
+                $self->set_event($type, $id, { %$item });
+            }
+            $n_data->{$id} = $item;
+        }
+        for my $id (keys %{$p_data}) {
+            $self->remove_event($type, $id);
+        }
+
+        $new_data->{$type} = $n_data;
+    }
+    $self->{prev_data} = $new_data;
+}
+
+# returns 1 if the hashes are different.
+sub diff_hash {
+    my ($self, $old, $new) = @_;
+
+    my %keys = ();
+    map { $keys{$_}++ } keys %$old, keys %$new;
+    for my $k (keys %keys) {
+        return 1 if (exists $old->{$k} && ! exists $new->{$k});
+        return 1 if (exists $new->{$k} && ! exists $old->{$k});
+        return 1 if (defined $old->{$k} && ! defined $new->{$k});
+        return 1 if (defined $new->{$k} && ! defined $old->{$k});
+        return 0 if (! defined $new->{$k} && ! defined $old->{$k});
+        return 1 if ($old->{$k} ne $new->{$k});
+    }
+    return 0;
+}
+
+sub grab_all_data {
+    my $self = shift;
+    my $sto  = Mgd::get_store();
+
+    # Normalize the domain data to the rest to simplify the differ.
+    # FIXME: Once new objects are swapped in, fix the original
+    my %dom = $sto->get_all_domains;
+    my @fixed_dom = ();
+    while (my ($name, $id) = each %dom) {
+        push(@fixed_dom, { namespace => $name, dmid => $id });
+    }
+    my %ret = ( domain => \@fixed_dom,
+        class  => [$sto->get_all_classes],
+        host   => [$sto->get_all_hosts],
+        device => [$sto->get_all_devices], );
+    return \%ret;
+}
 
 sub ua {
     my $self = shift;
@@ -127,11 +280,13 @@ sub check_device {
     unless ($response->is_success) {
         my $failed_after = $res_time - $start_time;
         if ($failed_after < 0.5) {
-            $self->broadcast_device_unreachable($dev->id);
+            $self->state_event('device', $dev->id, {observed_state => 'unreachable'})
+                if (!$dev->observed_unreachable);
             error("Port $get_port not listening on $hostip ($url)?  Error was: " . $response->status_line);
         } else {
             $failed_after = sprintf("%.02f", $failed_after);
-            $self->broadcast_host_unreachable($dev->hostid);
+            $self->state_event('host', $dev->hostid, {observed_state => 'unreachable'})
+                if (!$host->observed_unreachable);
             $self->{skip_host}{$dev->hostid} = 1;
             error("Timeout contacting $hostip dev $devid ($url):  took $failed_after seconds out of $timeout allowed");
         }
@@ -139,7 +294,8 @@ sub check_device {
     }
 
     # at this point we can reach the host
-    $self->broadcast_host_reachable($dev->hostid);
+    $self->state_event('host', $dev->hostid, {observed_state => 'reachable'})
+        if (!$host->observed_reachable);
     $self->{iow}->restart_monitoring_if_needed($hostip);
 
     my %stats;
@@ -198,7 +354,8 @@ sub check_device {
 
         # if success and the content matches, mark it writeable
         if ($testwrite->is_success && $testwrite->content eq $content) {
-            $self->broadcast_device_writeable($devid);
+            $self->state_event('device', $devid, {observed_state => 'writeable'})
+                if (!$dev->observed_writeable);
             debug("dev$devid: used = $used, total = $total, writeable = 1");
             return;
         }
@@ -206,7 +363,8 @@ sub check_device {
 
     # if we fall through to here, then we know that something is not so good, so mark it readable
     # which is guaranteed given we even tested writeability
-    $self->broadcast_device_readable($devid);
+    $self->state_event('device', $devid, {observed_state => 'readable'})
+        if (!$dev->observed_readable);
     debug("dev$devid: used = $used, total = $total, writeable = 0");
 }
 

@@ -2,7 +2,7 @@ package MogileFS::Server;
 use strict;
 use warnings;
 use vars qw($VERSION);
-$VERSION = "2.46";
+$VERSION = "2.50";
 
 =head1 NAME
 
@@ -64,12 +64,17 @@ use MogileFS::Worker::Monitor;
 use MogileFS::Worker::Fsck;
 use MogileFS::Worker::JobMaster;
 
-use MogileFS::HTTPFile;
-use MogileFS::Class;
-use MogileFS::Device;
-use MogileFS::Host;
-use MogileFS::FID;
+use MogileFS::Factory::Domain;
+use MogileFS::Factory::Class;
+use MogileFS::Factory::Host;
+use MogileFS::Factory::Device;
 use MogileFS::Domain;
+use MogileFS::Class;
+use MogileFS::Host;
+use MogileFS::Device;
+
+use MogileFS::HTTPFile;
+use MogileFS::FID;
 use MogileFS::DevFID;
 
 use MogileFS::Store;
@@ -99,13 +104,7 @@ sub run {
     MogileFS::Config->check_database;
     daemonize() if MogileFS->config("daemonize");
 
-    MogileFS::ProcManager->set_min_workers('queryworker' => MogileFS->config('query_jobs'));
-    MogileFS::ProcManager->set_min_workers('delete'      => MogileFS->config('delete_jobs'));
-    MogileFS::ProcManager->set_min_workers('replicate'   => MogileFS->config('replicate_jobs'));
-    MogileFS::ProcManager->set_min_workers('reaper'      => MogileFS->config('reaper_jobs'));
-    MogileFS::ProcManager->set_min_workers('monitor'     => MogileFS->config('monitor_jobs'));
-    MogileFS::ProcManager->set_min_workers('fsck'        => MogileFS->config('fsck_jobs'));
-    MogileFS::ProcManager->set_min_workers('job_master'  => 1);
+    MogileFS::ProcManager->set_min_workers('monitor'     => 1);
 
     # open up our log
     Sys::Syslog::openlog('mogilefsd', 'pid', 'daemon');
@@ -256,6 +255,22 @@ sub set_store {
     my ($s) = @_;
     $store = $s;
     $store_pid = $$;
+}
+
+sub domain_factory {
+    return MogileFS::Factory::Domain->get_factory;
+}
+
+sub class_factory {
+    return MogileFS::Factory::Class->get_factory;
+}
+
+sub host_factory {
+    return MogileFS::Factory::Host->get_factory;
+}
+
+sub device_factory {
+    return MogileFS::Factory::Device->get_factory;
 }
 
 # log stuff to syslog or the screen

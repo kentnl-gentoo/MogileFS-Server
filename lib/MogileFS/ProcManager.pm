@@ -6,6 +6,7 @@ use Symbol;
 use Socket;
 use MogileFS::Connection::Client;
 use MogileFS::Connection::Worker;
+use MogileFS::Util qw(apply_state_events);
 
 # This class handles keeping lists of workers and clients and
 # assigning them to each other when things happen.  You don't actually
@@ -43,8 +44,7 @@ my @prefork_cleanup;  # subrefs to run to clean stuff up before we make a new ch
 
 *error = \&Mgd::error;
 
-my %dev_util;         # devid -> utilization
-my $last_util_spray = 0;  # time we lost spread %dev_util to children
+my $monitor_good = 0; # ticked after monitor executes once after startup
 
 my $nowish;  # updated approximately once per second
 
@@ -298,6 +298,10 @@ sub foreach_pending_query {
     }
 }
 
+sub is_monitor_good {
+    return $monitor_good;
+}
+
 sub is_valid_job {
     my ($class, $job) = @_;
     return defined $jobs{$job};
@@ -310,7 +314,7 @@ sub valid_jobs {
 sub request_job_process {
     my ($class, $job, $n) = @_;
     return 0 unless $class->is_valid_job($job);
-    return 0 if $job eq 'job_master' && $n > 1; # ghetto special case
+    return 0 if ($job =~ /^(?:job_master|monitor)$/i && $n > 1); # ghetto special case
 
     $jobs{$job}->[0] = $n;
     $allkidsup = 0;
@@ -626,10 +630,6 @@ sub HandleChildRequest {
         # pass it on to our error handler, prefaced with the child's job
         Mgd::debug("[" . $child->job . "(" . $child->pid . ")] $1");
 
-    } elsif ($cmd =~ /^:state_change (\w+) (\d+) (\w+)/) {
-        my ($what, $whatid, $state) = ($1, $2, $3);
-        state_change($what, $whatid, $state, $child);
-
     } elsif ($cmd =~ /^queue_depth (\w+)/) {
         my $job   = $1;
         if ($job eq 'all') {
@@ -682,6 +682,14 @@ sub HandleChildRequest {
     } elsif ($cmd eq ":still_alive") {
         # a no-op
 
+    } elsif ($cmd =~ /^:monitor_events/) {
+        # Apply the state locally, so when we fork children they have a
+        # pre-parsed factory.
+        # Also replay the event back where it came, so the same mechanism
+        # applies and uses local changes.
+        apply_state_events(\$cmd);
+        MogileFS::ProcManager->send_to_all_children($cmd);
+
     } elsif ($cmd eq ":monitor_just_ran") {
         send_monitor_has_run($child);
 
@@ -698,14 +706,6 @@ sub HandleChildRequest {
         # and this will rebroadcast it to all other children
         # (including the one that just set it to us, but eh)
         MogileFS::Config->set_config($1, $2);
-    } elsif (my ($devid, $util) = $cmd =~ /^:set_dev_utilization (\d+) (.+)/) {
-        $dev_util{$devid} = $util;
-
-        # time to rebroadcast dev utilization messages to all children?
-        if ($nowish > $last_util_spray + 3) {
-            $last_util_spray = $nowish;
-            MogileFS::ProcManager->send_to_all_children(":set_dev_utilization " . join(" ", %dev_util));
-        }
     } else {
         # unknown command
         my $show = $cmd;
@@ -790,21 +790,6 @@ sub is_child {
     return $IsChild;
 }
 
-sub state_change {
-    my ($what, $whatid, $state, $exclude) = @_;
-    my $key = "$what-$whatid";
-    my $now = time();
-    foreach my $child (values %child) {
-        my $old = $child->{known_state}{$key} || "";
-        if (!$old || $old->[1] ne $state || $old->[0] < $now - 300) {
-            $child->{known_state}{$key} = [$now, $state];
-
-            $child->write(":state_change $what $whatid $state\r\n")
-                unless $exclude && $child == $exclude;
-        }
-    }
-}
-
 sub wake_a {
     my ($pkg, $class, $fromchild) = @_;  # from arg is optional (which child sent it)
     my $child = MogileFS::ProcManager->is_child;
@@ -819,13 +804,24 @@ sub send_to_all_children {
     my ($pkg, $msg, $exclude) = @_;
     foreach my $child (values %child) {
         next if $exclude && $child == $exclude;
-        $child->write("$msg\r\n");
+        $child->write($msg . "\r\n");
     }
 }
 
 sub send_monitor_has_run {
     my $child = shift;
-    for my $type (qw(replicate fsck queryworker delete)) {
+    # Gas up other workers if monitor's completed for the first time.
+    if (! $monitor_good) {
+        MogileFS::ProcManager->set_min_workers('queryworker' => MogileFS->config('query_jobs'));
+        MogileFS::ProcManager->set_min_workers('delete'      => MogileFS->config('delete_jobs'));
+        MogileFS::ProcManager->set_min_workers('replicate'   => MogileFS->config('replicate_jobs'));
+        MogileFS::ProcManager->set_min_workers('reaper'      => MogileFS->config('reaper_jobs'));
+        MogileFS::ProcManager->set_min_workers('fsck'        => MogileFS->config('fsck_jobs'));
+        MogileFS::ProcManager->set_min_workers('job_master'  => 1);
+        $monitor_good = 1;
+        $allkidsup    = 0;
+    }
+    for my $type (qw(queryworker)) {
         MogileFS::ProcManager->ImmediateSendToChildrenByJob($type, ":monitor_has_run", $child);
     }
 }
