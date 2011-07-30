@@ -2,7 +2,7 @@ package MogileFS::Server;
 use strict;
 use warnings;
 use vars qw($VERSION);
-$VERSION = "2.51";
+$VERSION = "2.52";
 
 =head1 NAME
 
@@ -78,7 +78,6 @@ use MogileFS::FID;
 use MogileFS::DevFID;
 
 use MogileFS::Store;
-use MogileFS::Store::MySQL;  # FIXME: don't load this until after reading their config, but before fork.
 
 use MogileFS::ReplicationPolicy::MultipleHosts;
 
