@@ -4,6 +4,7 @@ package MogileFS::Worker::Delete;
 use strict;
 use base 'MogileFS::Worker';
 use MogileFS::Util qw(error);
+use MogileFS::Server;
 
 # we select 1000 but only do a random 100 of them, to allow
 # for stateless parallelism
@@ -308,7 +309,7 @@ sub process_deletes {
         # (Note: we're tolerant of '0' as a devid, due to old buggy version which
         # would sometimes put that in there)
         my $dev = $devid ? Mgd::device_factory()->get_by_id($devid) : undef;
-        unless ($dev && $dev->exists) {
+        unless ($dev) {
             $done_with_devid->("devid_doesnt_exist");
             next;
         }

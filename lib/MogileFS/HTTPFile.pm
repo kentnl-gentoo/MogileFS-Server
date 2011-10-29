@@ -3,6 +3,7 @@ use strict;
 use warnings;
 use Carp qw(croak);
 use Socket qw(PF_INET IPPROTO_TCP SOCK_STREAM);
+use MogileFS::Server;
 use MogileFS::Util qw(error undeferr wait_for_readability wait_for_writeability);
 
 # (caching the connection used for HEAD requests)
@@ -111,7 +112,14 @@ sub size {
     my $res = $user_agent->head($path);
     if ($res->is_success) {
         delete $size_check_failcount{$host} if exists $size_check_failcount{$host};
-        return $res->header('content-length');
+        my $size = $res->header('content-length');
+        if (! defined $size &&
+            $res->header('server') =~ m/^lighttpd/) {
+            # lighttpd 1.4.x (main release) does not return content-length for
+            # 0 byte files.
+            return 0;
+        }
+        return $size;
     } else {
         if ($res->code == 404) {
             delete $size_check_failcount{$host} if exists $size_check_failcount{$host};
