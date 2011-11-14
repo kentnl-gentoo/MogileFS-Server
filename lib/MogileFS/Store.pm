@@ -297,7 +297,7 @@ sub ping {
 sub condthrow {
     my ($self, $optmsg) = @_;
     my $dbh = $self->dbh;
-    return unless $dbh->err;
+    return 1 unless $dbh->err;
     my ($pkg, $fn, $line) = caller;
     my $msg = "Database error from $pkg/$fn/$line: " . $dbh->errstr;
     $msg .= ": $optmsg" if $optmsg;
@@ -1325,8 +1325,10 @@ sub update_classid {
 sub enqueue_for_replication {
     my ($self, $fidid, $from_devid, $in) = @_;
 
-    $in = 0 unless $in;
-    my $nexttry = $self->unix_timestamp . " + " . int($in);
+    my $nexttry = 0;
+    if ($in) {
+        $nexttry = $self->unix_timestamp . " + " . int($in);
+    }
 
     $self->retry_on_deadlock(sub {
         $self->insert_ignore("INTO file_to_replicate (fid, fromdevid, nexttry) ".
@@ -1587,6 +1589,8 @@ sub grab_queue_chunk {
     my $tries = 3;
     my $work;
 
+    return 0 unless $self->lock_queue($queue);
+
     my $extwhere = shift || '';
     my $fields = 'fid, nexttry, failcount';
     $fields .= ', ' . $extfields if $extfields;
@@ -1613,6 +1617,7 @@ sub grab_queue_chunk {
         $dbh->do("UPDATE $queue SET nexttry = $ut + 1000 WHERE fid IN ($fidlist)");
         $dbh->commit;
     };
+    $self->unlock_queue($queue);
     if ($self->was_deadlock_error) {
         eval { $dbh->rollback };
         return ();
@@ -1979,6 +1984,11 @@ sub release_lock {
     my ($self, $lockname) = @_;
     die "release_lock not implemented for $self";
 }
+
+# MySQL has an issue where you either get excessive deadlocks, or INSERT's
+# hang forever around some transactions. Use ghetto locking to cope.
+sub lock_queue { 1 }
+sub unlock_queue { 1 }
 
 # returns up to $limit @fidids which are on provided $devid
 sub random_fids_on_device {
