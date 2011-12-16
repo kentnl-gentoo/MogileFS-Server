@@ -12,8 +12,8 @@ depend() {
 start() {
 	ebegin "Starting $NAME"
 	start-stop-daemon --start --quiet \
-		--pidfile ${PIDFILE} \
-		--exec ${BINARY} -- ${MOGSTORED_OPTS}
+		--pidfile=${PIDFILE} --exec ${BINARY} \
+		-- --daemonize --pidfile=${PIDFILE} ${MOGSTORED_OPTS}
 	eend $?
 }
 
