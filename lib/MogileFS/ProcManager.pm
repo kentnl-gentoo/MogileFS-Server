@@ -4,7 +4,6 @@ use warnings;
 use POSIX qw(:sys_wait_h sigprocmask SIGINT SIG_BLOCK SIG_UNBLOCK);
 use Symbol;
 use Socket;
-use MogileFS::Server;
 use MogileFS::Connection::Client;
 use MogileFS::Connection::Worker;
 use MogileFS::Util qw(apply_state_events);
@@ -707,6 +706,8 @@ sub HandleChildRequest {
         # and this will rebroadcast it to all other children
         # (including the one that just set it to us, but eh)
         MogileFS::Config->set_config($1, $2);
+    } elsif ($cmd =~ /^:refresh_monitor$/) {
+        MogileFS::ProcManager->ImmediateSendToChildrenByJob("monitor", $cmd);
     } else {
         # unknown command
         my $show = $cmd;

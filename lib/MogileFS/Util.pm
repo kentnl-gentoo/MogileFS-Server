@@ -2,7 +2,6 @@ package MogileFS::Util;
 use strict;
 use Carp qw(croak);
 use Time::HiRes;
-use MogileFS::Server;
 use MogileFS::Exception;
 use MogileFS::DeviceState;
 
@@ -34,6 +33,13 @@ sub apply_state_events {
         my $mode = delete $args->{ev_mode};
         my $type = delete $args->{ev_type};
         my $id   = delete $args->{ev_id};
+
+        # This special case feels gross, but that's what it is.
+        if ($type eq 'srvset') {
+            my $val = $mode eq 'set' ? $args->{value} : undef;
+            MogileFS::Config->cache_server_setting($args->{field}, $val);
+            next;
+        }
 
         my $old = $factories{$type}->get_by_id($id);
         if ($mode eq 'setstate') {

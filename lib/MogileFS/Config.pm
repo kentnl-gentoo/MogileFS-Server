@@ -5,7 +5,6 @@ use MogileFS::ProcManager;
 use Getopt::Long;
 use MogileFS::Store;
 use Sys::Hostname ();
-use MogileFS::Server;
 
 our @ISA = qw(Exporter);
 our @EXPORT = qw($DEBUG config set_config FSCK_QUEUE REBAL_QUEUE);
@@ -21,6 +20,7 @@ use constant REBAL_QUEUE => 2;
 use constant DEVICE_SUMMARY_CACHE_TIMEOUT => 15;
 
 my %conf;
+my %server_settings;
 sub set_config {
     shift if @_ == 3;
     my ($k, $v) = @_;
@@ -269,9 +269,18 @@ sub server_setting {
     return Mgd::get_store()->server_setting($key);
 }
 
+sub cache_server_setting {
+    my ($class, $key, $val) = @_;
+    if (! defined $val) {
+        delete $server_settings{$key}
+            if exists $server_settings{$key};
+    }
+    $server_settings{$key} = $val;
+}
+
 sub server_setting_cached {
-    my ($class, $key, $timeout) = @_;
-    return Mgd::get_store()->server_setting_cached($key, $timeout);
+    my ($class, $key) = @_;
+    return $server_settings{$key};
 }
 
 my $memc;
@@ -285,7 +294,7 @@ sub memcache_client {
     my $now = time();
     return $memc if $last_memc_server_fetch > $now - 30;
 
-    my @servers = split(/\s*,\s*/, MogileFS::Config->server_setting("memcache_servers") || "");
+    my @servers = split(/\s*,\s*/, MogileFS::Config->server_setting_cached("memcache_servers") || "");
     $memc->set_servers(\@servers);
     $last_memc_server_fetch = $now;
 

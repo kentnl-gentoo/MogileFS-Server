@@ -42,6 +42,52 @@ sub watchdog_timeout {
     30;
 }
 
+sub cache_refresh {
+    my $self = shift;
+
+    debug("Monitor running; checking DB for updates");
+    return unless $self->validate_dbh;
+
+    my $db_data   = $self->grab_all_data;
+
+    # Stack diffs to ship back later
+    $self->diff_data($db_data);
+
+    $self->send_events_to_parent;
+}
+
+sub usage_refresh {
+    my $self = shift;
+
+    debug("Monitor running; scanning usage files");
+    my $have_dbh = $self->validate_dbh;
+
+    $self->{skip_host}  = {};  # hostid -> 1 if already noted dead.
+    $self->{seen_hosts} = {}; # IP -> 1
+
+    my $dev_factory = MogileFS::Factory::Device->get_factory();
+
+    my $cur_iow = {};
+    # Run check_devices to test host/devs. diff against old values.
+    for my $dev ($dev_factory->get_all) {
+        if (my $state = $self->is_iow_diff($dev)) {
+            $self->state_event('device', $dev->id, {utilization => $state});
+        }
+        $cur_iow->{$dev->id} = $self->{devutil}->{cur}->{$dev->id};
+        next if $self->{skip_host}{$dev->hostid};
+        $self->check_device($dev, $have_dbh) if $dev->dstate->should_monitor;
+        $self->still_alive; # Ping parent if needed so we don't time out
+                            # given lots of devices.
+    }
+
+    $self->{devutil}->{prev} = $cur_iow;
+    # Set the IOWatcher hosts (once old monitor code has been disabled)
+
+    $self->send_events_to_parent;
+
+    $self->{iow}->set_hosts(keys %{$self->{seen_hosts}});
+}
+
 sub work {
     my $self = shift;
 
@@ -71,15 +117,7 @@ sub work {
     my $db_monitor;
     $db_monitor = sub {
         $self->parent_ping;
-        debug("Monitor running; checking DB for updates");
-        $self->validate_dbh;
-
-        my $db_data   = $self->grab_all_data;
-
-        # Stack diffs to ship back later
-        $self->diff_data($db_data);
-
-        $self->send_events_to_parent;
+        $self->cache_refresh;
         $db_monitor_ran++;
         Danga::Socket->AddTimer(4, $db_monitor);
     };
@@ -90,31 +128,7 @@ sub work {
     my $main_monitor;
     $main_monitor = sub {
         $self->parent_ping;
-        debug("Monitor running; scanning usage files");
-        $self->validate_dbh;
-
-        $self->{skip_host}  = {};  # hostid -> 1 if already noted dead.
-        $self->{seen_hosts} = {}; # IP -> 1
-
-        my $dev_factory = MogileFS::Factory::Device->get_factory();
-
-        my $cur_iow = {};
-        # Run check_devices to test host/devs. diff against old values.
-        for my $dev ($dev_factory->get_all) {
-            if (my $state = $self->is_iow_diff($dev)) {
-                $self->state_event('device', $dev->id, {utilization => $state});
-            }
-            $cur_iow->{$dev->id} = $self->{devutil}->{cur}->{$dev->id};
-            next if $self->{skip_host}{$dev->hostid};
-            $self->check_device($dev) if $dev->dstate->should_monitor;
-        }
-
-        $self->{devutil}->{prev} = $cur_iow;
-        # Set the IOWatcher hosts (once old monitor code has been disabled)
-
-        $self->send_events_to_parent;
-
-        $iow->set_hosts(keys %{$self->{seen_hosts}});
+        $self->usage_refresh;
         if ($db_monitor_ran) {
             $self->send_to_parent(":monitor_just_ran");
             $db_monitor_ran = 0;
@@ -123,7 +137,20 @@ sub work {
     };
 
     $main_monitor->();
+    Danga::Socket->AddOtherFds($self->psock_fd, sub{ $self->read_from_parent });
     Danga::Socket->EventLoop;
+}
+
+sub process_line {
+    my MogileFS::Worker::Monitor $self = shift;
+    my $lineref = shift;
+    if ($$lineref =~ /^:refresh_monitor$/) {
+        $self->cache_refresh;
+        $self->usage_refresh;
+        $self->send_to_parent(":monitor_just_ran");
+        return 1;
+    }
+    return 0;
 }
 
 # --------------------------------------------------------------------------
@@ -190,7 +217,9 @@ sub diff_data {
             my $id = $type eq 'domain' ? $item->{dmid}
                 : $type eq 'class'     ? $item->{dmid} . '-' . $item->{classid}
                 : $type eq 'host'      ? $item->{hostid}
-                : $type eq 'device'    ? $item->{devid} : die "Unknown type";
+                : $type eq 'device'    ? $item->{devid}
+                : $type eq 'srvset'    ? $item->{field}
+                : die "Unknown type";
             my $old = delete $p_data->{$id};
             # Special case: for devices, we don't care if mb_asof changes.
             # FIXME: Change the grab routine (or filter there?).
@@ -237,10 +266,18 @@ sub grab_all_data {
     while (my ($name, $id) = each %dom) {
         push(@fixed_dom, { namespace => $name, dmid => $id });
     }
+
+    my $set = $sto->server_settings;
+    my @fixed_set = ();
+    while (my ($field, $value) = each %$set) {
+        push(@fixed_set, { field => $field, value => $value });
+    }
+
     my %ret = ( domain => \@fixed_dom,
         class  => [$sto->get_all_classes],
         host   => [$sto->get_all_hosts],
-        device => [$sto->get_all_devices], );
+        device => [$sto->get_all_devices],
+        srvset => \@fixed_set, );
     return \%ret;
 }
 
@@ -253,7 +290,7 @@ sub ua {
 }
 
 sub check_device {
-    my ($self, $dev) = @_;
+    my ($self, $dev, $have_dbh) = @_;
 
     my $devid = $dev->id;
     my $host  = $dev->host;
@@ -319,7 +356,7 @@ sub check_device {
     my $last_update = $self->{last_db_update}{$dev->id} || 0;
     my $next_update = $last_update + UPDATE_DB_EVERY;
     my $now = time();
-    if ($now >= $next_update) {
+    if ($now >= $next_update && $have_dbh) {
         Mgd::get_store()->update_device_usage(mb_total => int($total / 1024),
                                               mb_used  => int($used / 1024),
                                               devid    => $devid);

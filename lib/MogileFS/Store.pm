@@ -4,7 +4,7 @@ use warnings;
 use Carp qw(croak);
 use MogileFS::Util qw(throw max error);
 use DBI;  # no reason a Store has to be DBI-based, but for now they all are.
-use List::Util ();
+use List::Util qw(shuffle);
 
 # this is incremented whenever the schema changes.  server will refuse
 # to start-up with an old schema version
@@ -49,12 +49,15 @@ sub new_from_dsn_user_pass {
         pass   => $pass,
         max_handles => $max_handles, # Max number of handles to allow
         raise_errors => $subclass->want_raise_errors,
-        slave_list_cachetime => 0,
+        slave_list_version => 0,
         slave_list_cache     => [],
         recheck_req_gen  => 0,  # incremented generation, of recheck of dbh being requested
         recheck_done_gen => 0,  # once recheck is done, copy of what the request generation was
         handles_left     => 0,  # amount of times this handle can still be verified
-        server_setting_cache => {}, # value-agnostic db setting cache.
+        connected_slaves => {},
+        dead_slaves      => {},
+        dead_backoff     => {}, # how many times in a row a slave has died
+        connect_timeout  => 30, # High default.
     }, $subclass;
     $self->init;
     return $self;
@@ -151,9 +154,13 @@ sub raise_errors {
     $self->dbh->{RaiseError} = 1;
 }
 
+sub set_connect_timeout { $_[0]{connect_timeout} = $_[1]; }
+
 sub dsn  { $_[0]{dsn}  }
 sub user { $_[0]{user} }
 sub pass { $_[0]{pass} }
+
+sub connect_timeout { $_[0]{connect_timeout} }
 
 sub init { 1 }
 sub post_dbi_connect { 1 }
@@ -172,24 +179,29 @@ sub is_slave {
     return $self->{slave};
 }
 
+sub _slaves_list_changed {
+    my $self = shift;
+    my $ver = MogileFS::Config->server_setting_cached('slave_version') || 0;
+    if ($ver <= $self->{slave_list_version}) {
+        return 0;
+    }
+    $self->{slave_list_version} = $ver;
+    # Restart connections from scratch if the configuration changed.
+    $self->{connected_slaves} = {};
+    return 1;
+}
+
 # Returns a list of arrayrefs, each being [$dsn, $username, $password] for connecting to a slave DB.
 sub _slaves_list {
     my $self = shift;
     my $now = time();
 
-    # only reload every 15 seconds.
-    if ($self->{slave_list_cachetime} > $now - 15) {
-        return @{$self->{slave_list_cache}};
-    }
-    $self->{slave_list_cachetime} = $now;
-    $self->{slave_list_cache}     = [];
-
-    my $sk = MogileFS::Config->server_setting('slave_keys')
+    my $sk = MogileFS::Config->server_setting_cached('slave_keys')
         or return ();
 
     my @ret;
     foreach my $key (split /\s*,\s*/, $sk) {
-        my $slave = MogileFS::Config->server_setting("slave_$key");
+        my $slave = MogileFS::Config->server_setting_cached("slave_$key");
 
         if (!$slave) {
             error("key for slave DB config: slave_$key not found in configuration");
@@ -204,8 +216,44 @@ sub _slaves_list {
         push @ret, [$dsn, $user, $pass]
     }
 
-    $self->{slave_list_cache}     = \@ret;
     return @ret;
+}
+
+sub _pick_slave {
+    my $self = shift;
+    my @temp = shuffle keys %{$self->{connected_slaves}};
+    return unless @temp;
+    return $self->{connected_slaves}->{$temp[0]};
+}
+
+sub _connect_slave {
+    my $self = shift;
+    my $slave_fulldsn = shift;
+    my $now = time();
+
+    my $dead_retry =
+        MogileFS::Config->server_setting_cached('slave_dead_retry_timeout') || 15;
+
+    my $dead_backoff = $self->{dead_backoff}->{$slave_fulldsn->[0]} || 0;
+    my $dead_timeout = $self->{dead_slaves}->{$slave_fulldsn->[0]};
+    return if (defined $dead_timeout
+        && $dead_timeout + ($dead_retry * $dead_backoff) > $now);
+    return if ($self->{connected_slaves}->{$slave_fulldsn->[0]});
+
+    my $newslave = $self->{slave} = $self->new_from_dsn_user_pass(@$slave_fulldsn);
+    $newslave->set_connect_timeout(
+        MogileFS::Config->server_setting_cached('slave_connect_timeout') || 1);
+    $self->{slave}->{next_check} = 0;
+    $newslave->mark_as_slave;
+    if ($self->check_slave) {
+        $self->{connected_slaves}->{$slave_fulldsn->[0]} = $newslave;
+        $self->{dead_backoff}->{$slave_fulldsn->[0]} = 0;
+    } else {
+        # Magic numbers are saddening...
+        $dead_backoff++ unless $dead_backoff > 20;
+        $self->{dead_slaves}->{$slave_fulldsn->[0]} = $now;
+        $self->{dead_backoff}->{$slave_fulldsn->[0]} = $dead_backoff;
+    }
 }
 
 sub get_slave {
@@ -213,21 +261,48 @@ sub get_slave {
 
     die "Incapable of having slaves." unless $self->can_do_slaves;
 
-    return $self->{slave} if $self->check_slave;
+    $self->{slave} = undef;
+    foreach my $slave (keys %{$self->{dead_slaves}}) {
+        my ($full_dsn) = grep { $slave eq $_->[0] } @{$self->{slave_list_cache}};
+        unless ($full_dsn) {
+            delete $self->{dead_slaves}->{$slave};
+            next;
+        }
+        $self->_connect_slave($full_dsn);
+    }
 
+    unless ($self->_slaves_list_changed) {
+        if ($self->{slave} = $self->_pick_slave) {
+            $self->{slave}->{recheck_req_gen} = $self->{recheck_req_gen};
+            return $self->{slave} if $self->check_slave;
+        }
+    }
+
+    if ($self->{slave}) {
+        my $dsn = $self->{slave}->{dsn};
+        $self->{dead_slaves}->{$dsn} = time();
+        $self->{dead_backoff}->{$dsn} = 0;
+        delete $self->{connected_slaves}->{$dsn};
+        error("Error talking to slave: $dsn");
+    }
     my @slaves_list = $self->_slaves_list;
 
     # If we have no slaves, then return silently.
     return unless @slaves_list;
 
-    foreach my $slave_fulldsn (@slaves_list) {
-        my $newslave = $self->{slave} = $self->new_from_dsn_user_pass(@$slave_fulldsn);
-        $self->{slave_next_check} = 0;
-        $newslave->mark_as_slave;
-        return $newslave
-            if $self->check_slave;
+    unless (MogileFS::Config->server_setting_cached('slave_skip_filtering') eq 'on') {
+        MogileFS::run_global_hook('slave_list_filter', \@slaves_list);
     }
 
+    $self->{slave_list_cache} = \@slaves_list;
+
+    foreach my $slave_fulldsn (@slaves_list) {
+        $self->_connect_slave($slave_fulldsn);
+    }
+
+    if ($self->{slave} = $self->_pick_slave) {
+        return $self->{slave};
+    }
     warn "Slave list exhausted, failing back to master.";
     return;
 }
@@ -239,7 +314,6 @@ sub read_store {
 
     if ($self->{slave_ok}) {
         if (my $slave = $self->get_slave) {
-            $slave->{recheck_req_gen} = $self->{recheck_req_gen};
             return $slave;
         }
     }
@@ -277,17 +351,28 @@ sub dbh {
         return $self->{dbh} if $self->{dbh};
     }
 
-    $self->{dbh} = DBI->connect($self->{dsn}, $self->{user}, $self->{pass}, {
-        PrintError => 0,
-        AutoCommit => 1,
-        # FUTURE: will default to on (have to validate all callers first):
-        RaiseError => ($self->{raise_errors} || 0),
-    }) or
+    eval {
+        local $SIG{ALRM} = sub { die "timeout\n" };
+        alarm($self->connect_timeout);
+        $self->{dbh} = DBI->connect($self->{dsn}, $self->{user}, $self->{pass}, {
+            PrintError => 0,
+            AutoCommit => 1,
+            # FUTURE: will default to on (have to validate all callers first):
+            RaiseError => ($self->{raise_errors} || 0),
+        });
+    };
+    alarm(0);
+    if ($@ eq "timeout\n") {
+        die "Failed to connect to database: timeout";
+    } elsif ($@) {
         die "Failed to connect to database: " . DBI->errstr;
+    }
     $self->post_dbi_connect;
     $self->{handles_left} = $self->{max_handles} if $self->{max_handles};
     return $self->{dbh};
 }
+
+sub have_dbh { return 1 if $_[0]->{dbh}; } 
 
 sub ping {
     my $self = shift;
@@ -873,21 +958,6 @@ sub server_setting {
     my ($self, $key) = @_;
     return $self->dbh->selectrow_array("SELECT value FROM server_settings WHERE field=?",
                                        undef, $key);
-}
-
-# generic server setting cache.
-# note that you can call the same server setting with different timeouts, but
-# the timeout specified at the time of ... timeout, wins.
-sub server_setting_cached {
-    my ($self, $key, $timeout) = @_;
-    $self->{server_setting_cache}->{$key} ||= {val => '', refresh => 0};
-    my $cache = $self->{server_setting_cache}->{$key};
-    my $now = time();
-    if ($now > $cache->{refresh}) {
-        $cache->{val}     = $self->server_setting($key);
-        $cache->{refresh} = $now + $timeout;
-    }
-    return $cache->{val};
 }
 
 sub server_settings {
@@ -1617,12 +1687,18 @@ sub grab_queue_chunk {
         $dbh->do("UPDATE $queue SET nexttry = $ut + 1000 WHERE fid IN ($fidlist)");
         $dbh->commit;
     };
-    $self->unlock_queue($queue);
     if ($self->was_deadlock_error) {
         eval { $dbh->rollback };
-        return ();
+        $work = undef;
+    } else {
+        $self->condthrow;
     }
-    $self->condthrow;
+    # FIXME: Super extra paranoia to prevent deadlocking.
+    # Need to handle or die on all errors above, but $@ can get reset. For now
+    # we'll just always ensure there's no transaction running at the end here.
+    # A (near) release should figure the error detection correctly.
+    if ($dbh->{AutoCommit} == 0) { eval { $dbh->rollback }; }
+    $self->unlock_queue($queue);
 
     return defined $work ? values %$work : ();
 }

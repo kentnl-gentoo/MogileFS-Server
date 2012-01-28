@@ -187,11 +187,12 @@ sub cmd_test {
 
 sub cmd_clear_cache {
     my MogileFS::Worker::Query $self = shift;
-    my $args = shift;
 
-    # TODO: Use this to tell Monitor worker to rebroadcast all state
+    $self->forget_that_monitor_has_run;
+    $self->send_to_parent(":refresh_monitor");
+    $self->wait_for_monitor;
 
-    return $self->ok_line;
+    return $self->ok_line(@_);
 }
 
 sub cmd_create_open {
@@ -772,7 +773,7 @@ sub cmd_create_device {
     }
 
     if (eval { $sto->create_device($devid, $hostid, $status) }) {
-        return $self->ok_line;
+        return $self->cmd_clear_cache;
     }
 
     my $errc = error_code($@);
@@ -795,7 +796,7 @@ sub cmd_create_domain {
         return $self->err_line('failure', "$@");
     }
 
-    return $self->ok_line({ domain => $domain });
+    return $self->cmd_clear_cache({ domain => $domain });
 }
 
 sub cmd_delete_domain {
@@ -810,7 +811,7 @@ sub cmd_delete_domain {
         return $self->err_line('domain_not_found');
 
     if (eval { $sto->delete_domain($dmid) }) {
-        return $self->ok_line({ domain => $domain });
+        return $self->cmd_clear_cache({ domain => $domain });
     }
 
     my $err = error_code($@);
@@ -867,7 +868,7 @@ sub cmd_create_class {
         replpolicy => $replpolicy) if $replpolicy;
 
     # return success
-    return $self->ok_line({ class => $class, mindevcount => $mindevcount, domain => $domain });
+    return $self->cmd_clear_cache({ class => $class, mindevcount => $mindevcount, domain => $domain });
 }
 
 sub cmd_update_class {
@@ -896,7 +897,7 @@ sub cmd_delete_class {
     return $self->err_line('class_not_found') unless defined $clsid;
 
     if (eval { Mgd::get_store()->delete_class($dmid, $clsid) }) {
-        return $self->ok_line({ domain => $domain, class => $class });
+        return $self->cmd_clear_cache({ domain => $domain, class => $class });
     }
 
     my $errc = error_code($@);
@@ -943,7 +944,7 @@ sub cmd_create_host {
     $sto->update_host($hostid, { map { $_ => $args->{$_} } @toupdate });
 
     # return success
-    return $self->ok_line({ hostid => $hostid, hostname => $hostname });
+    return $self->cmd_clear_cache({ hostid => $hostid, hostname => $hostname });
 }
 
 sub cmd_update_host {
@@ -970,7 +971,7 @@ sub cmd_delete_host {
 
     $sto->delete_host($hostid);
 
-    return $self->ok_line;
+    return $self->cmd_clear_cache;
 }
 
 sub cmd_get_domains {
@@ -1312,9 +1313,9 @@ sub cmd_set_weight {
     return $self->err_line('host_mismatch')
         unless $dev->host->hostname eq $hostname;
 
-    $dev->set_weight($weight);
+    Mgd::get_store()->set_device_weight($dev->id, $weight);
 
-    return $self->ok_line;
+    return $self->cmd_clear_cache;
 }
 
 sub cmd_set_state {
@@ -1338,7 +1339,7 @@ sub cmd_set_state {
         unless $dev->can_change_to_state($state);
 
     Mgd::get_store()->set_device_state($dev->id, $state);
-    return $self->ok_line;
+    return $self->cmd_clear_cache;
 }
 
 sub cmd_noop {
@@ -1352,31 +1353,6 @@ sub cmd_replicate_now {
 
     my $rv = Mgd::get_store()->replicate_now;
     return $self->ok_line({ count => int($rv) });
-}
-
-sub cmd_checker {
-    my MogileFS::Worker::Query $self = shift;
-    my $args = shift;
-
-    my $new_setting;
-    if ($args->{disable}) {
-        $new_setting = 'off';
-    } elsif ($args->{level}) {
-        # they want to turn it on or change the level, so let's ensure they
-        # specified a valid level
-        if (MogileFS::Worker::Checker::is_valid_level($args->{level})) {
-            $new_setting = $args->{level};
-        } else {
-            return $self->err_line('invalid_checker_level');
-        }
-    }
-
-    if (defined $new_setting) {
-        MogileFS::Config->set_server_setting('fsck_enable', $new_setting);
-        return $self->ok_line;
-    }
-
-    $self->err_line('failure');
 }
 
 sub cmd_set_server_setting {
@@ -1393,6 +1369,14 @@ sub cmd_set_server_setting {
     return $self->err_line("invalid_format", $@) if $@;
 
     MogileFS::Config->set_server_setting($key, $cleanval);
+
+    # GROSS HACK: slave settings are managed directly by MogileFS::Client, but
+    # I need to add a version key, so we check and inject that code here.
+    # FIXME: Move this when slave keys are managed by query worker commands!
+    if ($key =~ /^slave_/) {
+        Mgd::get_store()->incr_server_setting('slave_version', 1);
+    }
+
     return $self->ok_line;
 }
 

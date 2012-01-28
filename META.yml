@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               MogileFS-Server
-version:            2.55
+version:            2.56
 abstract:           MogileFS (distributed filesystem) server
 author:
     - Brad Fitzpatrick <brad@danga.com>
@@ -31,7 +31,6 @@ no_index:
     directory:
         - t
         - inc
-        - lib/mogdeps
     package:
         - ProcessHandle
         - TrackerHandle

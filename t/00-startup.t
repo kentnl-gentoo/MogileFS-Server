@@ -9,6 +9,10 @@ use MogileFS::Server;
 use MogileFS::Util qw(error_code);
 use MogileFS::Test;
 
+BEGIN {
+    $ENV{TESTING} = 1;
+}
+
 find_mogclient_or_skip();
 
 # use mogadm to init it,
@@ -108,9 +112,9 @@ ok($tmptrack->mogadm("device", "add", "hostB", 4), "created dev4 on hostB");
 {
     my $was = $be->{timeout};  # can't use local on phash :(
     $be->{timeout} = 10;
-    ok($be->do_request("do_monitor_round", {}), "waited for monitor")
+    ok($be->do_request("clear_cache", {}), "waited for monitor")
         or die "Failed to wait for monitor";
-    ok($be->do_request("do_monitor_round", {}), "waited for monitor")
+    ok($be->do_request("clear_cache", {}), "waited for monitor")
         or die "Failed to wait for monitor";
     $be->{timeout} = $was;
 }
@@ -275,9 +279,6 @@ ok($ms3, "got mogstored3");
 ok($tmptrack->mogadm("host", "add", "hostC", "--ip=$hostC_ip", "--status=alive"), "created hostC");
 ok($tmptrack->mogadm("device", "add", "hostC", 5), "created dev5 on hostC");
 ok($tmptrack->mogadm("device", "add", "hostC", 6), "created dev6 on hostC");
-
-# let it be discovered
-sleep(5);  # FIXME: make an explicit "rescan" or "remonitor" job to mogilefsd, just for test suite
 
 ok($tmptrack->mogadm("device", "mark", "hostB", 3, "dead"), "marked device B/3 dead");
 ok($tmptrack->mogadm("device", "mark", "hostB", 4, "dead"), "marked device B/4 dead");

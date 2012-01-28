@@ -82,21 +82,22 @@ sub check_slave {
 
     return 0 unless $self->{slave};
 
-    my $next_check = \$self->{slave_next_check};
+    my $next_check = \$self->{slave}->{next_check};
 
     if ($$next_check > time()) {
         return 1;
     }
 
-    my $master_status = eval { $self->dbh->selectrow_hashref("SHOW MASTER STATUS") };
-    warn "Error thrown: '$@' while trying to get master status." if $@;
+    #my $slave_status = eval { $self->{slave}->dbh->selectrow_hashref("SHOW SLAVE STATUS") };
+    #warn "Error thrown: '$@' while trying to get slave status." if $@;
 
-    my $slave_status = eval { $self->{slave}->dbh->selectrow_hashref("SHOW SLAVE STATUS") };
-    warn "Error thrown: '$@' while trying to get slave status." if $@;
-
-    # compare contrast, return 0 if not okay.
-    # Master: File Position
-    # Slave: 
+    # TODO: Check show slave status *unless* a server setting is present to
+    # tell us to ignore it (like in a multi-DC setup).
+    eval { $self->{slave}->dbh };
+    if ($@) {
+        warn "Error while checking slave: $@";
+        return 0;
+    }
 
     # call time() again here because SQL blocks.
     $$next_check = time() + 5;
