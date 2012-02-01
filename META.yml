@@ -1,6 +1,6 @@
 --- #YAML:1.0
 name:               MogileFS-Server
-version:            2.56
+version:            2.57
 abstract:           MogileFS (distributed filesystem) server
 author:
     - Brad Fitzpatrick <brad@danga.com>
