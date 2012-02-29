@@ -118,6 +118,8 @@ sub update_devcount {
     my $no_lock = delete $opts{no_lock};
     croak "Bogus options" if %opts;
 
+    return 1 if MogileFS::Config->server_setting_cached('skip_devcount');
+
     my $fidid = $self->{fidid};
 
     my $sto = Mgd::get_store();
@@ -158,7 +160,14 @@ sub mark_unreachable {
 sub delete {
     my $fid = shift;
     my $sto = Mgd::get_store();
+    my $memc = MogileFS::Config->memcache_client;
+    if ($memc) {
+        $fid->_tryload;
+    }
     $sto->delete_fidid($fid->id);
+    if ($memc && $fid->{_loaded}) {
+        $memc->delete("mogfid:$fid->{dmid}:$fid->{dkey}");
+    }
 }
 
 # returns 1 on success, 0 on duplicate key error, dies on exception
@@ -221,7 +230,7 @@ sub devids_meet_policy {
     my @devs = $self->devs;
     # This is a little heavy handed just to fix the 'devcount' cache, but
     # doing it here ensures we get the error logged.
-    if (@devs != $self->devcount) {
+    unless (MogileFS::Config->server_setting_cached('skip_devcount') || @devs == $self->devcount) {
         return 0;
     }
 

@@ -4,7 +4,6 @@ use warnings;
 
 use base 'MogileFS::Worker';
 use fields (
-            'last_db_update',  # devid -> time.  update db less often than poll interval.
             'last_test_write', # devid -> time.  time we last tried writing to a device.
             'skip_host',       # hostid -> 1 if already noted dead (reset every loop)
             'seen_hosts',      # IP -> 1 (reset every loop)
@@ -13,6 +12,7 @@ use fields (
             'prev_data',       # DB data from previous run
             'devutil',         # Running tally of device utilization
             'events',          # Queue of state events
+            'have_masterdb',   # Hint flag for if the master DB is available
             );
 
 use Danga::Socket 1.56;
@@ -28,13 +28,13 @@ sub new {
     my $self = fields::new($class);
     $self->SUPER::new($psock);
 
-    $self->{last_db_update}  = {};
     $self->{last_test_write} = {};
     $self->{iow}             = MogileFS::IOStatWatcher->new;
     $self->{prev_data}       = { domain => {}, class => {}, host => {},
         device => {} };
     $self->{devutil}         = { cur => {}, prev => {} };
     $self->{events}          = [];
+    $self->{have_masterdb}   = 0;
     return $self;
 }
 
@@ -46,12 +46,24 @@ sub cache_refresh {
     my $self = shift;
 
     debug("Monitor running; checking DB for updates");
-    return unless $self->validate_dbh;
+    # "Fix" our local cache of this flag, so we always check the master DB.
+    MogileFS::Config->cache_server_setting('_master_db_alive', 1);
+    my $have_dbh = $self->validate_dbh;
+    if ($have_dbh && !$self->{have_masterdb}) {
+        $self->{have_masterdb} = 1;
+        $self->set_event('srvset', '_master_db_alive', { value => 1 });
+    } elsif (!$have_dbh) {
+        $self->{have_masterdb} = 0;
+        $self->set_event('srvset', '_master_db_alive', { value => 0 });
+        error("Cannot connect to master database!");
+    }
 
-    my $db_data   = $self->grab_all_data;
+    if ($have_dbh) {
+        my $db_data   = $self->grab_all_data;
 
-    # Stack diffs to ship back later
-    $self->diff_data($db_data);
+        # Stack diffs to ship back later
+        $self->diff_data($db_data);
+    }
 
     $self->send_events_to_parent;
 }
@@ -61,6 +73,14 @@ sub usage_refresh {
 
     debug("Monitor running; scanning usage files");
     my $have_dbh = $self->validate_dbh;
+    my $updateable_devices;
+
+    # See if we should be allowed to update the device table rows.
+    if ($have_dbh && Mgd::get_store()->get_lock('mgfs:device_update', 0)) {
+        # Fetch the freshlist list of entries, to avoid excessive writes.
+        $updateable_devices = { map { $_->{devid} => $_ }
+            Mgd::get_store()->get_all_devices };
+    }
 
     $self->{skip_host}  = {};  # hostid -> 1 if already noted dead.
     $self->{seen_hosts} = {}; # IP -> 1
@@ -75,9 +95,14 @@ sub usage_refresh {
         }
         $cur_iow->{$dev->id} = $self->{devutil}->{cur}->{$dev->id};
         next if $self->{skip_host}{$dev->hostid};
-        $self->check_device($dev, $have_dbh) if $dev->dstate->should_monitor;
+        $self->check_device($dev, $have_dbh, $updateable_devices)
+            if $dev->dstate->should_monitor;
         $self->still_alive; # Ping parent if needed so we don't time out
                             # given lots of devices.
+    }
+
+    if ($have_dbh) {
+        Mgd::get_store()->release_lock('mgfs:device_update');
     }
 
     $self->{devutil}->{prev} = $cur_iow;
@@ -290,7 +315,7 @@ sub ua {
 }
 
 sub check_device {
-    my ($self, $dev, $have_dbh) = @_;
+    my ($self, $dev, $have_dbh, $updateable_devices) = @_;
 
     my $devid = $dev->id;
     my $host  = $dev->host;
@@ -353,14 +378,15 @@ sub check_device {
     }
 
     # only update database every ~15 seconds per device
-    my $last_update = $self->{last_db_update}{$dev->id} || 0;
-    my $next_update = $last_update + UPDATE_DB_EVERY;
     my $now = time();
-    if ($now >= $next_update && $have_dbh) {
-        Mgd::get_store()->update_device_usage(mb_total => int($total / 1024),
-                                              mb_used  => int($used / 1024),
-                                              devid    => $devid);
-        $self->{last_db_update}{$devid} = $now;
+    if ($have_dbh && $updateable_devices) {
+        my $devrow = $updateable_devices->{$devid};
+        my $last = ($devrow && $devrow->{mb_asof}) ? $devrow->{mb_asof} : 0;
+        if ($last + UPDATE_DB_EVERY < $now) {
+            Mgd::get_store()->update_device_usage(mb_total => int($total / 1024),
+                                                  mb_used  => int($used / 1024),
+                                                  devid    => $devid);
+        }
     }
 
     # next if we're not going to try this now

@@ -1,7 +1,7 @@
 package MogileFS::Store;
 use strict;
 use warnings;
-use Carp qw(croak);
+use Carp qw(croak confess);
 use MogileFS::Util qw(throw max error);
 use DBI;  # no reason a Store has to be DBI-based, but for now they all are.
 use List::Util qw(shuffle);
@@ -57,7 +57,7 @@ sub new_from_dsn_user_pass {
         connected_slaves => {},
         dead_slaves      => {},
         dead_backoff     => {}, # how many times in a row a slave has died
-        connect_timeout  => 30, # High default.
+        connect_timeout  => 10, # High default.
     }, $subclass;
     $self->init;
     return $self;
@@ -171,12 +171,12 @@ sub mark_as_slave {
     my $self = shift;
     die "Incapable of becoming slave." unless $self->can_do_slaves;
 
-    $self->{slave} = 1;
+    $self->{is_slave} = 1;
 }
 
 sub is_slave {
     my $self = shift;
-    return $self->{slave};
+    return $self->{is_slave};
 }
 
 sub _slaves_list_changed {
@@ -290,7 +290,7 @@ sub get_slave {
     # If we have no slaves, then return silently.
     return unless @slaves_list;
 
-    my $slave_skip_filtering = MogileFS::Config->server_setting('slave_skip_filtering');
+    my $slave_skip_filtering = MogileFS::Config->server_setting_cached('slave_skip_filtering');
 
     unless (defined $slave_skip_filtering && $slave_skip_filtering eq 'on') {
         MogileFS::run_global_hook('slave_list_filter', \@slaves_list);
@@ -351,6 +351,14 @@ sub dbh {
             $self->{recheck_done_gen} = $self->{recheck_req_gen};
         }
         return $self->{dbh} if $self->{dbh};
+    }
+
+    # Shortcut flag: if monitor thinks the master is down, avoid attempting to
+    # connect to it for now. If we already have a connection to the master,
+    # keep using it as above.
+    if (!$self->is_slave) {
+        my $flag = MogileFS::Config->server_setting_cached('_master_db_alive', 0);
+        return if (defined $flag && $flag == 0);;
     }
 
     eval {

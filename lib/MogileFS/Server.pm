@@ -2,7 +2,7 @@ package MogileFS::Server;
 use strict;
 use warnings;
 use vars qw($VERSION);
-$VERSION = "2.57";
+$VERSION = "2.58";
 
 =head1 NAME
 
@@ -27,7 +27,7 @@ use Time::HiRes ();
 use Net::Netmask;
 use LWP::UserAgent;
 use List::Util;
-use Socket ();
+use Socket qw(SO_KEEPALIVE);
 
 use MogileFS::Util qw(daemonize);
 use MogileFS::Sys;
@@ -130,6 +130,7 @@ sub run {
                                            Reuse     => 1,
                                            Listen    => 1024 )
             or die "Error creating socket: $@\n";
+        $server->sockopt(SO_KEEPALIVE, 1);
 
         # save sub to accept a client
         push @servers, $server;
