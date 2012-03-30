@@ -3,6 +3,7 @@ use strict;
 use warnings;
 use Carp qw(croak);
 use Socket qw(PF_INET IPPROTO_TCP SOCK_STREAM);
+use Digest;
 use MogileFS::Server;
 use MogileFS::Util qw(error undeferr wait_for_readability wait_for_writeability);
 
@@ -97,6 +98,9 @@ sub delete {
 use constant FILE_MISSING => -1;
 sub size {
     my $self = shift;
+
+    return $self->{_size} if defined $self->{_size};
+
     my ($host, $port, $uri, $path) = map { $self->{$_} } qw(host port uri url);
 
     return undef if (exists $size_check_retry_after{$host}
@@ -117,8 +121,10 @@ sub size {
             $res->header('server') =~ m/^lighttpd/) {
             # lighttpd 1.4.x (main release) does not return content-length for
             # 0 byte files.
+            $self->{_size} = 0;
             return 0;
         }
+        $self->{_size} = $size;
         return $size;
     } else {
         if ($res->code == 404) {
@@ -135,6 +141,114 @@ sub size {
         return undeferr("Failed HEAD check for $path (" . $res->code . "): "
             . $res->message); 
     }
+}
+
+sub digest_mgmt {
+    my ($self, $alg, $ping_cb, $reason) = @_;
+    my $mogconn = $self->host->mogstored_conn;
+    my $node_timeout = MogileFS->config("node_timeout");
+    my $sock;
+    my $rv;
+    my $expiry;
+
+    $reason = defined($reason) ? " $reason" : "";
+    my $uri = $self->{uri};
+    my $req = "$alg $uri$reason\r\n";
+    my $reqlen = length $req;
+
+    # a dead/stale socket may not be detected until we try to recv on it
+    # after sending a request
+    my $retries = 2;
+
+    # assuming the storage node can checksum at >=2MB/s, low expectations here
+    my $response_timeout = $self->size / (2 * 1024 * 1024);
+
+    my $flag_nosignal = MogileFS::Sys->flag_nosignal;
+    local $SIG{'PIPE'} = "IGNORE" unless $flag_nosignal;
+
+retry:
+    $sock = $mogconn->sock($node_timeout) or return;
+    $rv = send($sock, $req, $flag_nosignal);
+    if ($! || $rv != $reqlen) {
+        my $err = $!;
+        $mogconn->mark_dead;
+        if ($retries-- <= 0) {
+            $req =~ tr/\r\n//d;
+            $err = $err ? "send() error ($req): $err" :
+                          "short send() ($req): $rv != $reqlen";
+            $err = $mogconn->{ip} . ":" . $mogconn->{port} . " $err";
+            return undeferr($err);
+        }
+        goto retry;
+    }
+
+    $expiry = Time::HiRes::time() + $response_timeout;
+    while (!wait_for_readability(fileno($sock), 1.0) &&
+           (Time::HiRes::time() < $expiry)) {
+        $ping_cb->();
+    }
+
+    $rv = <$sock>;
+    if (! $rv) {
+        $mogconn->mark_dead;
+        return undeferr("EOF from mogstored") if ($retries-- <= 0);
+        goto retry;
+    } elsif ($rv =~ /^\Q$uri\E \Q$alg\E=([a-f0-9]{32,128})\r\n/) {
+        my $hexdigest = $1;
+
+        if ($hexdigest eq FILE_MISSING) {
+            # FIXME, this could be another error like EMFILE/ENFILE
+            return FILE_MISSING;
+        }
+        my $checksum = eval {
+            MogileFS::Checksum->from_string(0, "$alg:$hexdigest")
+        };
+        return undeferr("$alg failed for $uri: $@") if $@;
+        return $checksum->{checksum};
+    } elsif ($rv =~ /^ERROR /) {
+        return; # old server, fallback to HTTP
+    }
+    return undeferr("mogstored failed to handle ($alg $uri)");
+}
+
+sub digest_http {
+    my ($self, $alg, $ping_cb) = @_;
+
+    # don't SIGPIPE us (why don't we just globally ignore SIGPIPE?)
+    my $flag_nosignal = MogileFS::Sys->flag_nosignal;
+    local $SIG{'PIPE'} = "IGNORE" unless $flag_nosignal;
+
+    # TODO: refactor
+    my $node_timeout = MogileFS->config("node_timeout");
+    # Hardcoded connection cache size of 20 :(
+    $user_agent ||= LWP::UserAgent->new(timeout => $node_timeout, keep_alive => 20);
+    my $digest = Digest->new($alg);
+
+    my %opts = (
+        # default (4K) is tiny, use 1M like replicate
+        ':read_size_hint' => 0x100000,
+        ':content_cb' => sub {
+            $digest->add($_[0]);
+            $ping_cb->();
+        }
+    );
+
+    my $path = $self->{url};
+    my $res = $user_agent->get($path, %opts);
+
+    return $digest->digest if $res->is_success;
+    return FILE_MISSING if $res->code == 404;
+    return undeferr("Failed $alg (GET) check for $path (" . $res->code . "): "
+                    . $res->message);
+}
+
+sub digest {
+    my ($self, $alg, $ping_cb, $reason) = @_;
+    my $digest = $self->digest_mgmt($alg, $ping_cb, $reason);
+
+    return $digest if ($digest && $digest ne FILE_MISSING);
+
+    $self->digest_http($alg, $ping_cb);
 }
 
 1;

@@ -110,6 +110,7 @@ sub setup_database {
 sub filter_create_sql {
     my ($self, $sql) = @_;
     $sql =~ s/\bUNSIGNED\b//g;
+    $sql =~ s/\bVARBINARY\(\d+\)/bytea/g;
     $sql =~ s/\b(?:TINY|MEDIUM)INT\b/SMALLINT/g;
     $sql =~ s/\bINT\s+NOT\s+NULL\s+AUTO_INCREMENT\b/SERIAL/g;
     $sql =~ s/# /-- /g;
@@ -741,6 +742,8 @@ sub mark_fidid_unreachable {
 
 sub delete_fidid {
     my ($self, $fidid) = @_;
+    $self->delete_checksum($fidid);
+    $self->condthrow;
     $self->dbh->do("DELETE FROM file WHERE fid=?", undef, $fidid);
     $self->condthrow;
     $self->dbh->do("DELETE FROM tempfile WHERE fid=?", undef, $fidid);
@@ -828,6 +831,40 @@ sub release_lock {
     $self->condthrow;
     $self->{lock_depth} = 0;
     return $rv;
+}
+
+sub BLOB_BIND_TYPE { { pg_type => PG_BYTEA } }
+
+sub set_checksum {
+	my ($self, $fidid, $hashtype, $checksum) = @_;
+    my $dbh = $self->dbh;
+
+    $dbh->begin_work;
+    eval {
+        my $sth = $dbh->prepare("INSERT INTO checksum " .
+                                "(fid, hashtype, checksum) ".
+                                "VALUES (?, ?, ?)");
+        $sth->bind_param(1, $fidid);
+        $sth->bind_param(2, $hashtype);
+        $sth->bind_param(3, $checksum, BLOB_BIND_TYPE);
+        $sth->execute;
+    };
+    if ($@ || $dbh->err) {
+        if ($self->was_duplicate_error) {
+            eval {
+                my $sth = $dbh->prepare("UPDATE checksum " .
+                                        "SET hashtype = ?, checksum = ? " .
+                                        "WHERE fid = ?");
+                $sth->bind_param(1, $hashtype);
+                $sth->bind_param(2, $checksum, BLOB_BIND_TYPE);
+                $sth->bind_param(3, $fidid);
+                $sth->execute;
+            };
+            $self->condthrow;
+        }
+    }
+    $dbh->commit;
+    $self->condthrow;
 }
 
 1;

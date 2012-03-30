@@ -19,7 +19,8 @@ use List::Util qw(shuffle);
 # 13: modifies 'server_settings.value' to TEXT for wider values
 #     also adds a TEXT 'arg' column to file_to_queue for passing arguments
 # 14: modifies 'device' mb_total, mb_used to INT for devs > 16TB
-use constant SCHEMA_VERSION => 14;
+# 15: adds checksum table, adds 'hashtype' column to 'class' table
+use constant SCHEMA_VERSION => 15;
 
 sub new {
     my ($class) = @_;
@@ -497,7 +498,7 @@ use constant TABLES => qw( domain class file tempfile file_to_delete
                             unreachable_fids file_on file_on_corrupt host
                             device server_settings file_to_replicate
                             file_to_delete_later fsck_log file_to_queue
-                            file_to_delete2 );
+                            file_to_delete2 checksum);
 
 sub setup_database {
     my $sto = shift;
@@ -532,6 +533,7 @@ sub setup_database {
     $sto->upgrade_modify_server_settings_value;
     $sto->upgrade_add_file_to_queue_arg;
     $sto->upgrade_modify_device_size;
+    $sto->upgrade_add_class_hashtype;
 
     return 1;
 }
@@ -598,7 +600,8 @@ sub TABLE_class {
     PRIMARY KEY (dmid,classid),
     classname     VARCHAR(50),
     UNIQUE      (dmid,classname),
-    mindevcount   TINYINT UNSIGNED NOT NULL
+    mindevcount   TINYINT UNSIGNED NOT NULL,
+    hashtype  TINYINT UNSIGNED
     )"
 }
 
@@ -804,6 +807,14 @@ sub TABLE_file_to_delete2 {
     )"
 }
 
+sub TABLE_checksum {
+    "CREATE TABLE checksum (
+    fid INT UNSIGNED NOT NULL PRIMARY KEY,
+    hashtype TINYINT UNSIGNED NOT NULL,
+    checksum VARBINARY(64) NOT NULL
+    )"
+}
+
 # these five only necessary for MySQL, since no other database existed
 # before, so they can just create the tables correctly to begin with.
 # in the future, there might be new alters that non-MySQL databases
@@ -822,6 +833,13 @@ sub upgrade_add_class_replpolicy {
     my ($self) = @_;
     unless ($self->column_type("class", "replpolicy")) {
         $self->dowell("ALTER TABLE class ADD COLUMN replpolicy VARCHAR(255)");
+    }
+}
+
+sub upgrade_add_class_hashtype {
+    my ($self) = @_;
+    unless ($self->column_type("class", "hashtype")) {
+        $self->dowell("ALTER TABLE class ADD COLUMN hashtype TINYINT UNSIGNED");
     }
 }
 
@@ -926,6 +944,17 @@ sub update_class_replpolicy {
     };
     $self->condthrow;
     return 1;
+}
+
+# return 1 on success, die otherwise
+sub update_class_hashtype {
+    my $self = shift;
+    my %arg  = $self->_valid_params([qw(dmid classid hashtype)], @_);
+    eval {
+    $self->dbh->do("UPDATE class SET hashtype=? WHERE dmid=? AND classid=?",
+                   undef, $arg{hashtype}, $arg{dmid}, $arg{classid});
+    };
+    $self->condthrow;
 }
 
 sub nfiles_with_dmid_classid_devcount {
@@ -1212,6 +1241,8 @@ sub delete_class {
 
 sub delete_fidid {
     my ($self, $fidid) = @_;
+    eval { $self->delete_checksum($fidid); };
+    $self->condthrow;
     eval { $self->dbh->do("DELETE FROM file WHERE fid=?", undef, $fidid); };
     $self->condthrow;
     eval { $self->dbh->do("DELETE FROM tempfile WHERE fid=?", undef, $fidid); };
@@ -1296,12 +1327,15 @@ sub get_all_classes {
     my ($self) = @_;
     my (@ret, $row);
 
-    my $repl_col = "";
+    my @cols = qw/dmid classid classname mindevcount/;
     if ($self->cached_schema_version >= 10) {
-        $repl_col = ", replpolicy";
+        push @cols, 'replpolicy';
+        if ($self->cached_schema_version >= 15) {
+            push @cols, 'hashtype';
+        }
     }
-
-    my $sth = $self->dbh->prepare("SELECT dmid, classid, classname, mindevcount $repl_col FROM class");
+    my $cols = join(', ', @cols);
+    my $sth = $self->dbh->prepare("SELECT $cols FROM class");
     $sth->execute;
     push @ret, $row while $row = $sth->fetchrow_hashref;
     return @ret;
@@ -2123,6 +2157,39 @@ sub random_fids_on_device {
 
     @some_fids = @some_fids[0..$limit-1] if $limit < @some_fids;
     return @some_fids;
+}
+
+sub BLOB_BIND_TYPE { undef; }
+
+sub set_checksum {
+    my ($self, $fidid, $hashtype, $checksum) = @_;
+    my $dbh = $self->dbh;
+    die "Your database does not support REPLACE! Reimplement set_checksum!" unless $self->can_replace;
+
+    eval {
+        my $sth = $dbh->prepare("REPLACE INTO checksum " .
+                                "(fid, hashtype, checksum) " .
+                                "VALUES (?, ?, ?)");
+        $sth->bind_param(1, $fidid);
+        $sth->bind_param(2, $hashtype);
+        $sth->bind_param(3, $checksum, BLOB_BIND_TYPE);
+        $sth->execute;
+    };
+    $self->condthrow;
+}
+
+sub get_checksum {
+    my ($self, $fidid) = @_;
+
+    $self->dbh->selectrow_hashref("SELECT fid, hashtype, checksum " .
+                                  "FROM checksum WHERE fid = ?",
+                                  undef, $fidid);
+}
+
+sub delete_checksum {
+    my ($self, $fidid) = @_;
+
+    $self->dbh->do("DELETE FROM checksum WHERE fid = ?", undef, $fidid);
 }
 
 1;

@@ -1,7 +1,7 @@
 package MogileFS::Store::SQLite;
 use strict;
 use warnings;
-use DBI;
+use DBI qw(:sql_types);
 use DBD::SQLite 1.13;
 use MogileFS::Util qw(throw);
 use base 'MogileFS::Store';
@@ -111,6 +111,7 @@ sub TABLE_class {
       classid       TINYINT UNSIGNED NOT NULL,
       classname     VARCHAR(50),
       mindevcount   TINYINT UNSIGNED NOT NULL,
+      hashtype  TINYINT UNSIGNED,
       UNIQUE (dmid,classid),
       UNIQUE      (dmid,classname)
 )"
@@ -254,6 +255,7 @@ sub note_done_replicating {
     my ($self, $fidid) = @_;
 }
 
+sub BLOB_BIND_TYPE { SQL_BLOB }
 
 1;
 

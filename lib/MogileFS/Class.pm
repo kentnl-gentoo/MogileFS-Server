@@ -2,6 +2,7 @@ package MogileFS::Class;
 use strict;
 use warnings;
 use MogileFS::Util qw(throw);
+use MogileFS::Checksum;
 
 =head1
 
@@ -24,6 +25,13 @@ sub id   { $_[0]{classid} }
 sub name { $_[0]{classname} }
 sub mindevcount { $_[0]{mindevcount} }
 sub dmid { $_[0]{dmid} }
+sub hashtype { $_[0]{hashtype} }
+sub hashname { $MogileFS::Checksum::TYPE2NAME{$_[0]{hashtype}} }
+
+sub hashtype_string {
+    my $self = shift;
+    $self->hashtype ? $self->hashname : "NONE";
+}
 
 sub repl_policy_string {
     my $self = shift;
