@@ -2,7 +2,7 @@ package MogileFS::Server;
 use strict;
 use warnings;
 use vars qw($VERSION);
-$VERSION = "2.61";
+$VERSION = "2.62";
 
 =head1 NAME
 
@@ -30,7 +30,6 @@ use List::Util;
 use Socket qw(SO_KEEPALIVE);
 
 use MogileFS::Util qw(daemonize);
-use MogileFS::Sys;
 use MogileFS::Config;
 
 use MogileFS::ProcManager;
