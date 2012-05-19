@@ -2,7 +2,7 @@ package MogileFS::Server;
 use strict;
 use warnings;
 use vars qw($VERSION);
-$VERSION = "2.60";
+$VERSION = "2.61";
 
 =head1 NAME
 
@@ -267,6 +267,7 @@ sub device_factory {
 sub log {
     # simple logging functionality
     if (! $MogileFS::Config::daemonize) {
+        $| = 1;
         # syslog acts like printf so we have to use printf and append a \n
         shift; # ignore the first parameter (info, warn, critical, etc)
         my $mask = shift; # format string

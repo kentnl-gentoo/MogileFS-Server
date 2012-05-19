@@ -34,7 +34,6 @@ lib/MogileFS/Store.pm
 lib/MogileFS/Store/MySQL.pm
 lib/MogileFS/Store/Postgres.pm
 lib/MogileFS/Store/SQLite.pm
-lib/MogileFS/Sys.pm
 lib/MogileFS/Test.pm
 lib/MogileFS/Util.pm
 lib/MogileFS/Factory.pm
@@ -76,14 +75,17 @@ t/20-filepaths.t
 t/30-rebalance.t
 t/40-httpfile.t
 t/50-checksum.t
+t/60-fsck.t
 t/checksum.t
 t/fid-stat.t
 t/mogstored-shutdown.t
 t/multiple-hosts-replpol.t
 t/replpolicy-parsing.t
 t/replpolicy.t
+t/store-sqlite.t
 t/store.t
 t/util.t
 TODO
 TESTING
-META.yml                                 Module meta-data (added by MakeMaker)
+META.yml                                 Module YAML meta-data (added by MakeMaker)
+META.json                                Module JSON meta-data (added by MakeMaker)

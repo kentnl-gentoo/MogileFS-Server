@@ -23,9 +23,7 @@ find_mogclient_or_skip();
 # etc
 
 my $sto = eval { temp_store(); };
-if ($sto) {
-    plan tests => 73;
-} else {
+if (!$sto) {
     plan skip_all => "Can't create temporary test database: $@";
     exit 0;
 }
@@ -88,6 +86,12 @@ ok($be->do_request("test", {}), "test ping again worked");
 ok($tmptrack->mogadm("domain", "add", "todie"), "created todie domain");
 ok($tmptrack->mogadm("domain", "delete", "todie"), "delete todie domain");
 ok(!$tmptrack->mogadm("domain", "delete", "todie"), "didn't delete todie domain again");
+
+ok($tmptrack->mogadm("domain", "add", "hasclass"), "created hasclass domain");
+ok($tmptrack->mogadm("class", "add", "hasclass", "nodel"), "created nodel class");
+ok(!$tmptrack->mogadm("domain", "delete", "hasclass"), "didn't delete hasclass domain");
+ok($tmptrack->mogadm("class", "delete", "hasclass", "nodel"), "created nodel class");
+ok($tmptrack->mogadm("domain", "delete", "hasclass"), "didn't delete hasclass domain");
 
 ok($tmptrack->mogadm("domain", "add", "testdom"), "created test domain");
 ok($tmptrack->mogadm("class", "add", "testdom", "1copy", "--mindevcount=1"), "created 1copy class in testdom");
@@ -355,3 +359,5 @@ sub try_for {
     }
     return 0;
 }
+
+done_testing();

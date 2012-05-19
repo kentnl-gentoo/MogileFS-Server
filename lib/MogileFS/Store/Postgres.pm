@@ -609,19 +609,6 @@ sub update_devcount_atomic {
     return $rv;
 }
 
-sub should_begin_replicating_fidid {
-    my ($self, $fidid) = @_;
-    my $lockname = "mgfs:fid:$fidid:replicate";
-    return 1 if $self->get_lock($lockname, 1);
-    return 0;
-}
-
-sub note_done_replicating {
-    my ($self, $fidid) = @_;
-    my $lockname = "mgfs:fid:$fidid:replicate";
-    $self->release_lock($lockname);
-}
-
 # enqueue a fidid for replication, from a specific deviceid (can be undef), in a given number of seconds.
 sub enqueue_for_replication {
     my ($self, $fidid, $from_devid, $in) = @_;
@@ -754,12 +741,12 @@ sub delete_fidid {
 
 sub replace_into_file {
     my $self = shift;
-    my %arg  = $self->_valid_params([qw(fidid dmid key length classid)], @_);
+    my %arg  = $self->_valid_params([qw(fidid dmid key length classid devcount)], @_);
     $self->insert_or_update(
-        insert => "INSERT INTO file (fid, dmid, dkey, length, classid, devcount) VALUES (?, ?, ?, ?, ?, 0)",
-        insert_vals => [ @arg{'fidid', 'dmid', 'key', 'length', 'classid'} ],
-        update => "UPDATE file SET dmid=?, dkey=?, length=?, classid=?, devcount=0 WHERE fid=?",
-        update_vals => [ @arg{'dmid', 'key', 'length', 'classid', 'fidid'} ],
+        insert => "INSERT INTO file (fid, dmid, dkey, length, classid, devcount) VALUES (?, ?, ?, ?, ?, ?)",
+        insert_vals => [ @arg{'fidid', 'dmid', 'key', 'length', 'classid', 'devcount'} ],
+        update => "UPDATE file SET dmid=?, dkey=?, length=?, classid=?, devcount=? WHERE fid=?",
+        update_vals => [ @arg{'dmid', 'key', 'length', 'classid', 'fidid', 'devcount'} ],
     );
     $self->condthrow;
 }

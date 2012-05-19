@@ -33,6 +33,7 @@ WriteMakefile(
         'IO::AIO'         => 0,
         'MogileFS::Client' => 0,
         DBI                => 0,
+        'Test::More'        => 0.88,    # 0.88 for done_testing() support
     },
     META_MERGE              => {
         no_index => {

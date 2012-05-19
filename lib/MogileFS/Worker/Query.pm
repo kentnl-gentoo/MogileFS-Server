@@ -5,7 +5,7 @@ use strict;
 use warnings;
 
 use base 'MogileFS::Worker';
-use fields qw(querystarttime reqid);
+use fields qw(querystarttime reqid callid);
 use MogileFS::Util qw(error error_code first weighted_list
                       device_state eurl decode_url_args);
 use MogileFS::HTTPFile;
@@ -20,6 +20,7 @@ sub new {
 
     $self->{querystarttime} = undef;
     $self->{reqid}          = undef;
+    $self->{callid}         = undef;
     return $self;
 }
 
@@ -100,13 +101,14 @@ sub process_line {
 
     # fallback to normal command handling
     if ($line =~ /^(\w+)\s*(.*)/) {
-        my ($cmd, $args) = ($1, $2);
+        my ($cmd, $orig_args) = ($1, $2);
         $cmd = lc($cmd);
 
         no strict 'refs';
         my $cmd_handler = *{"cmd_$cmd"}{CODE};
+        my $args = decode_url_args(\$orig_args);
+        $self->{callid} = $args->{callid};
         if ($cmd_handler) {
-            my $args = decode_url_args(\$args);
             local $MogileFS::REQ_altzone = ($args->{zone} && $args->{zone} eq 'alt');
             eval {
                 $cmd_handler->($self, $args);
@@ -213,6 +215,8 @@ sub cmd_create_open {
     my $dmid = $args->{dmid};
     my $key = $args->{key} || "";
     my $multi = $args->{multi_dest} ? 1 : 0;
+    my $size = $args->{size} || undef; # Size is optional at create time,
+                                       # but used to grep devices if available
 
     # optional profiling of stages, if $args->{debug_profile}
     my @profpoints;  # array of [point,hires-starttime]
@@ -249,6 +253,10 @@ sub cmd_create_open {
 
     unless (MogileFS::run_global_hook('cmd_create_open_order_devices', [Mgd::device_factory()->get_all], \@devices)) {
         @devices = sort_devs_by_freespace(Mgd::device_factory()->get_all);
+    }
+
+    if ($size) {
+        @devices = grep { ($_->mb_free * 1024*1024) > $size } @devices;
     }
 
     # find suitable device(s) to put this file on.
@@ -453,25 +461,21 @@ sub cmd_create_close {
                             key     => $key,
                             length  => $size,
                             classid => $trow->{classid},
+                            devcount => 1,
                             );
 
     # mark it as needing replicating:
     $fid->enqueue_for_replication();
 
-    if ($fid->update_devcount) {
-        # call the hook - if this fails, we need to back the file out
-        my $rv = MogileFS::run_global_hook('file_stored', $args);
-        if (defined $rv && ! $rv) { # undef = no hooks, 1 = success, 0 = failure
-            $fid->delete;
-            return $self->err_line("plugin_aborted");
-        }
-
-        # all went well
-        return $self->ok_line;
-    } else {
-        # FIXME: handle this better
-        return $self->err_line("db_error");
+    # call the hook - if this fails, we need to back the file out
+    my $rv = MogileFS::run_global_hook('file_stored', $args);
+    if (defined $rv && ! $rv) { # undef = no hooks, 1 = success, 0 = failure
+        $fid->delete;
+        return $self->err_line("plugin_aborted");
     }
+
+    # all went well, we would've hit condthrow on DB errors
+    return $self->ok_line;
 }
 
 sub cmd_updateclass {
@@ -857,6 +861,7 @@ sub cmd_delete_domain {
 
     my $err = error_code($@);
     return $self->err_line('domain_has_files') if $err eq "has_files";
+    return $self->err_line('domain_has_classes') if $err eq "has_classes";
     return $self->err_line("failure");
 }
 
@@ -1709,6 +1714,7 @@ sub ok_line {
     my $id = defined $self->{reqid} ? "$self->{reqid} " : '';
 
     my $args = shift || {};
+    $args->{callid} = $self->{callid} if defined $self->{callid};
     my $argline = join('&', map { eurl($_) . "=" . eurl($args->{$_}) } keys %$args);
     $self->send_to_parent("${id}${delay}OK $argline");
     return 1;
@@ -1769,8 +1775,9 @@ sub err_line {
     }
 
     my $id = defined $self->{reqid} ? "$self->{reqid} " : '';
+    my $callid = defined $self->{callid} ? ' ' . eurl($self->{callid}) : '';
 
-    $self->send_to_parent("${id}${delay}ERR $err_code " . eurl($err_text));
+    $self->send_to_parent("${id}${delay}ERR $err_code " . eurl($err_text) . $callid);
     return 0;
 }
 

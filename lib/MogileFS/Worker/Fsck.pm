@@ -137,14 +137,9 @@ sub check_fid {
     }
 
     # This is a simple fixup case
-    unless (MogileFS::Config->server_setting_cached('skip_devcount') || scalar($fid->devids) == $fid->devcount) {
-        # log a bad count
-        $fid->fsck_log(EV_BAD_COUNT);
-
-        # TODO: We could fix this without a complete fix pass
-        # $fid->update_devcount();
-        return $fix->();
-    }
+    # If we got here, we already know we have no policy violation and
+    # don't need to call $fix->() to just fix a devcount
+    $self->maybe_fix_devcount($fid);
 
     # missing checksum row
     if ($fid->class->hashtype && ! $fid->checksum) {
@@ -216,9 +211,6 @@ use constant CANT_FIX => 0;
 sub fix_fid {
     my ($self, $fid) = @_;
     debug(sprintf("Fixing FID %d", $fid->id));
-
-    # This should happen first, since the fid gets awkwardly reloaded...
-    $fid->update_devcount;
 
     # make devfid objects from the devids that this fid is on,
     my @dfids = map { MogileFS::DevFID->new($_, $fid) } $fid->devids;
@@ -303,7 +295,11 @@ sub fix_fid {
         $check_dfids->("desperate");
 
         # still can't fix it?
-        return CANT_FIX unless @good_devs;
+        unless (@good_devs) {
+            $self->forget_bad_devs($fid, @bad_devs);
+            $fid->update_devcount;
+            return CANT_FIX;
+        }
 
         # wow, we actually found it!
         $fid->fsck_log(EV_FOUND_FID);
@@ -313,12 +309,7 @@ sub fix_fid {
         # wrong, with only one file_on record...) and re-replicate
     }
 
-    # remove the file_on mappings for devices that were bogus/missing.
-    foreach my $bdev (@bad_devs) {
-        error("removing file_on mapping for fid=" . $fid->id . ", dev=" . $bdev->id);
-        $fid->forget_about_device($bdev);
-    }
-
+    $self->forget_bad_devs($fid, @bad_devs);
     # in case the devcount or similar was fixed.
     $fid->want_reload;
 
@@ -333,10 +324,7 @@ sub fix_fid {
     }
     
     # Clean up the device count if it's wrong
-    unless(MogileFS::Config->server_setting_cached('skip_devcount') || scalar($fid->devids) == $fid->devcount) {
-        $fid->update_devcount();
-        $fid->fsck_log(EV_BAD_COUNT);
-    }
+    $self->maybe_fix_devcount($fid);
 
     return HANDLED;
 }
@@ -448,6 +436,26 @@ sub fix_checksums {
     } else {
         $self->all_checksums_bad($fid, $checksums);
     }
+}
+
+# remove the file_on mappings for devices that were bogus/missing.
+sub forget_bad_devs {
+    my ($self, $fid, @bad_devs) = @_;
+    foreach my $bdev (@bad_devs) {
+        error("removing file_on mapping for fid=" . $fid->id . ", dev=" . $bdev->id);
+        $fid->forget_about_device($bdev);
+    }
+}
+
+sub maybe_fix_devcount {
+    # don't even log BCNT errors if skip_devcount is enabled
+    return if MogileFS::Config->server_setting_cached('skip_devcount');
+
+    my ($self, $fid) = @_;
+    return if scalar($fid->devids) == $fid->devcount;
+    # log a bad count
+    $fid->fsck_log(EV_BAD_COUNT);
+    $fid->update_devcount();
 }
 
 1;

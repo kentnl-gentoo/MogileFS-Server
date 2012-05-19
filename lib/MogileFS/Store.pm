@@ -1269,12 +1269,12 @@ sub delete_and_return_tempfile_row {
 
 sub replace_into_file {
     my $self = shift;
-    my %arg  = $self->_valid_params([qw(fidid dmid key length classid)], @_);
+    my %arg  = $self->_valid_params([qw(fidid dmid key length classid devcount)], @_);
     die "Your database does not support REPLACE! Reimplement replace_into_file!" unless $self->can_replace;
     eval {
         $self->dbh->do("REPLACE INTO file (fid, dmid, dkey, length, classid, devcount) ".
-                       "VALUES (?,?,?,?,?,0) ", undef,
-                       @arg{'fidid', 'dmid', 'key', 'length', 'classid'});
+                       "VALUES (?,?,?,?,?,?) ", undef,
+                       @arg{'fidid', 'dmid', 'key', 'length', 'classid', 'devcount'});
     };
     $self->condthrow;
 }
@@ -1580,36 +1580,16 @@ sub get_fidid_chunks_by_device {
     return $fidids;
 }
 
-# takes two arguments, fidid to be above, and optional limit (default
-# 1,000).  returns up to that that many fidids above the provided
-# fidid.  returns array of MogileFS::FID objects, sorted by fid ids.
-sub get_fids_above_id {
-    my ($self, $fidid, $limit) = @_;
-    $limit ||= 1000;
-    $limit = int($limit);
-
-    my @ret;
-    my $dbh = $self->dbh;
-    my $sth = $dbh->prepare("SELECT fid, dmid, dkey, length, classid, devcount ".
-                            "FROM   file ".
-                            "WHERE  fid > ? ".
-                            "ORDER BY fid LIMIT $limit");
-    $sth->execute($fidid);
-    while (my $row = $sth->fetchrow_hashref) {
-        push @ret, MogileFS::FID->new_from_db_row($row);
-    }
-    return @ret;
-}
-
-# Same as above, but returns unblessed hashref.
-sub get_fidids_above_id {
-    my ($self, $fidid, $limit) = @_;
+# gets fidids above fidid_low up to (and including) fidid_high
+sub get_fidids_between {
+    my ($self, $fidid_low, $fidid_high, $limit) = @_;
     $limit ||= 1000;
     $limit = int($limit);
 
     my $dbh = $self->dbh;
-    my $fidids = $dbh->selectcol_arrayref(qq{SELECT fid FROM file WHERE fid > ?
-        ORDER BY fid LIMIT $limit}, undef, $fidid);
+    my $fidids = $dbh->selectcol_arrayref(qq{SELECT fid FROM file
+        WHERE fid > ? and fid <= ?
+        ORDER BY fid LIMIT $limit}, undef, $fidid_low, $fidid_high);
     return $fidids;
 }
 
@@ -1774,8 +1754,9 @@ sub grab_files_to_queued {
 # and tell it not to.
 sub should_begin_replicating_fidid {
     my ($self, $fidid) = @_;
-    warn("Inefficient implementation of should_begin_replicating_fidid() in $self!\n");
-    1;
+    my $lockname = "mgfs:fid:$fidid:replicate";
+    return 1 if $self->get_lock($lockname, 1);
+    return 0;
 }
 
 # called when replicator is done replicating a fid, so you can cleanup
@@ -1789,6 +1770,8 @@ sub should_begin_replicating_fidid {
 # locking in this pair of functions.
 sub note_done_replicating {
     my ($self, $fidid) = @_;
+    my $lockname = "mgfs:fid:$fidid:replicate";
+    $self->release_lock($lockname);
 }
 
 sub find_fid_from_file_to_replicate {
@@ -2139,25 +2122,6 @@ sub release_lock {
 # hang forever around some transactions. Use ghetto locking to cope.
 sub lock_queue { 1 }
 sub unlock_queue { 1 }
-
-# returns up to $limit @fidids which are on provided $devid
-sub random_fids_on_device {
-    my ($self, $devid, $limit) = @_;
-    $limit = int($limit) || 100;
-
-    my $dbh = $self->dbh;
-
-    # FIXME: this blows. not random.  and good chances these will
-    # eventually get to point where they're un-rebalance-able, and we
-    # never move on past the first 5000
-    my @some_fids = List::Util::shuffle(@{
-        $dbh->selectcol_arrayref("SELECT fid FROM file_on WHERE devid=? LIMIT 5000",
-                                 undef, $devid) || []
-                                 });
-
-    @some_fids = @some_fids[0..$limit-1] if $limit < @some_fids;
-    return @some_fids;
-}
 
 sub BLOB_BIND_TYPE { undef; }
 
