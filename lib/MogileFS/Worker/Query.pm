@@ -1062,7 +1062,7 @@ sub cmd_get_paths {
 
     # memcache mappings are as follows:
     #  mogfid:<dmid>:<dkey> -> fidid
-    #  mogdevids:<fidid>    -> \@devids  (and TODO: invalidate when the replication or deletion is run!)
+    #  mogdevids:<fidid>    -> \@devids  (and TODO: invalidate when deletion is run!)
 
     # if you specify 'noverify', that means a correct answer isn't needed and memcache can
     # be used.
@@ -1143,18 +1143,18 @@ sub cmd_get_paths {
     # keep one partially-bogus path around just in case we have nothing else to send.
     my $backup_path;
 
+    # files on devices set for drain may disappear soon.
+    my @drain_paths;
+
     # construct result paths
     foreach my $dev (@sorted_devs) {
-        next unless $dev && ($dev->can_read_from);
+        next unless $dev && $dev->host;
 
-        my $host = $dev->host;
-        next unless $dev && $host;
         my $dfid = MogileFS::DevFID->new($dev, $fid);
         my $path = $dfid->get_url;
-        my $currently_down =
-            $host->observed_unreachable || $dev->observed_unreachable;
+        my $currently_up = $dev->should_read_from;
 
-        if ($currently_down) {
+        if (! $currently_up) {
             $backup_path = $path;
             next;
         }
@@ -1165,9 +1165,24 @@ sub cmd_get_paths {
             $args->{noverify}    ||
             $dfid->size_matches;
 
+        if ($dev->dstate->should_drain) {
+            push @drain_paths, $path;
+            next;
+        }
+
         my $n = ++$ret->{paths};
         $ret->{"path$n"} = $path;
         last if $n == $pathcount;   # one verified, one likely seems enough for now.  time will tell.
+    }
+
+    # deprioritize devices set for drain, they could disappear soon...
+    # Clients /should/ try to use lower-numbered paths first to avoid this.
+    if ($ret->{paths} < $pathcount && @drain_paths) {
+        foreach my $path (@drain_paths) {
+            my $n = ++$ret->{paths};
+            $ret->{"path$n"} = $path;
+            last if $n == $pathcount;
+        }
     }
 
     # use our backup path if all else fails
@@ -1309,12 +1324,8 @@ sub cmd_edit_file {
     @list = grep {
         my $devid = $_;
         my $dev = $dmap->{$devid};
-        my $host = $dev ? $dev->host : undef;
 
-        $dev
-        && $host
-        && $dev->can_read_from
-        && !($host->observed_unreachable || $dev->observed_unreachable);
+        $dev && $dev->should_read_from;
     } @list;
 
     # Take first remaining device from list

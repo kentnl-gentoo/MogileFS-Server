@@ -192,4 +192,47 @@ ok(1 == $sto->delete_checksum(6), "checksum deleted OK");
 ok(0 == $sto->delete_checksum(6), "checksum delete MISS");
 ok(!defined $sto->get_checksum(6), "undef on missing checksum");
 
+# case-sensitivity tests for list_keys
+my %arg = (
+    fidid => 1234,
+    dmid => $dmid,
+    key => 'Case_Sensitive_Clod',
+    length => 1,
+    classid => $clsid,
+    devcount => 1
+);
+$sto->replace_into_file(%arg);
+my $rows;
+
+# ensure existing (broken) case-insensitive list_keys works for MySQL/SQLite
+# LIKE is always case-sensitive in Postgres, so its behavior for list_keys
+# was never broken.
+$rows = $sto->get_keys_like($dmid, "case", undef, 1000);
+if (ref($sto) eq "MogileFS::Store::Postgres") {
+    ok(scalar @$rows == 0, "Postgres list_keys is case-sensitive");
+} else {
+    ok($rows->[0] eq 'Case_Sensitive_Clod', "list_keys matches insensitively");
+}
+
+# make list_keys case-sensitive
+MogileFS::Config->set_server_setting("case_sensitive_list_keys", 1);
+MogileFS::Config->cache_server_setting("case_sensitive_list_keys", 1);
+
+$rows = $sto->get_keys_like($dmid, "case", undef, 1000);
+ok(scalar @$rows == 0, "case-incorrect list_keys fails to match");
+$rows = $sto->get_keys_like($dmid, "Case", undef, 1000);
+ok($rows->[0] eq 'Case_Sensitive_Clod', "case-correct list_keys matches");
+ok(scalar @$rows == 1, "only one row matched");
+
+# make list_keys case-insensitive again
+MogileFS::Config->set_server_setting("case_sensitive_list_keys", 0);
+MogileFS::Config->cache_server_setting("case_sensitive_list_keys", 0);
+
+$rows = $sto->get_keys_like($dmid, "case", undef, 1000);
+if (ref($sto) eq "MogileFS::Store::Postgres") {
+    ok(scalar @$rows == 0, "Postgres list_keys is case-sensitive");
+} else {
+    ok($rows->[0] eq 'Case_Sensitive_Clod', "list_keys matches insensitively (again)");
+}
+
 done_testing();
