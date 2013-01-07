@@ -29,6 +29,7 @@ use constant EV_BAD_COUNT        => "BCNT";
 use constant EV_BAD_CHECKSUM     => "BSUM";
 use constant EV_NO_CHECKSUM      => "NSUM";
 use constant EV_MULTI_CHECKSUM   => "MSUM";
+use constant EV_BAD_HASHTYPE     => "BALG";
 
 use POSIX ();
 
@@ -59,11 +60,12 @@ sub work {
         my @fids = ();
         while (my $todo = shift @{$queue_todo}) {
             my $fid = MogileFS::FID->new($todo->{fid});
-            unless ($fid->exists) {
+            if ($fid->exists) {
+                push(@fids, $fid);
+            } else {
                 # FID stopped existing before being checked.
                 $sto->delete_fid_from_file_to_queue($fid->id, FSCK_QUEUE);
             }
-            push(@fids, $fid);
         }
         return unless @fids;
 
@@ -106,9 +108,28 @@ sub check_fid {
     my ($self, $fid) = @_;
 
     my $fix = sub {
+        # we cached devids without locking for the fast path,
+        # ensure we get an up-to-date list in the slow path.
+        $fid->forget_cached_devids;
+
+        my $sto = Mgd::get_store();
+        unless ($sto->should_begin_replicating_fidid($fid->id)) {
+            error("Fsck stalled for fid $fid: failed to acquire lock");
+            return STALLED;
+        }
+
+        unless ($fid->exists) {
+            # FID stopped existing while doing (or waiting on)
+            # the fast check, give up on this fid
+            $sto->note_done_replicating($fid->id);
+            return HANDLED;
+        }
+
         my $fixed = eval { $self->fix_fid($fid) };
+        my $err = $@;
+        $sto->note_done_replicating($fid->id);
         if (! defined $fixed) {
-            error("Fsck stalled for fid $fid: $@");
+            error("Fsck stalled for fid $fid: $err");
             return STALLED;
         }
         $fid->fsck_log(EV_CANT_FIX) if ! $fixed;
@@ -313,7 +334,7 @@ sub fix_fid {
     # in case the devcount or similar was fixed.
     $fid->want_reload;
 
-    $self->fix_checksums($fid, $checksums) if $alg && $alg ne "off";
+    $self->fix_checksums($fid, $alg, $checksums) if $alg && $alg ne "off";
 
     # Note: this will reload devids, if they called 'note_on_device'
     # or 'forget_about_device'
@@ -383,7 +404,7 @@ sub all_checksums_bad {
 }
 
 sub fix_checksums {
-    my ($self, $fid, $checksums) = @_;
+    my ($self, $fid, $alg, $checksums) = @_;
     my $cur_checksum = $fid->checksum;
     my @all_checksums = keys(%$checksums);
 
@@ -391,7 +412,14 @@ sub fix_checksums {
         my $disk_checksum = $all_checksums[0];
         if ($cur_checksum) {
             if ($cur_checksum->{checksum} ne $disk_checksum) {
-                $fid->fsck_log(EV_BAD_CHECKSUM);
+                my $expect = $cur_checksum->info;
+                my $actual = "$alg:" . unpack("H*", $disk_checksum);
+                error("$cur_checksum does not match disk: $actual");
+                if ($alg ne $cur_checksum->hashname) {
+                    $fid->fsck_log(EV_BAD_HASHTYPE);
+                } else {
+                    $fid->fsck_log(EV_BAD_CHECKSUM);
+                }
             }
         } else { # fresh row to checksum
             my $hashtype = $fid->class->hashtype;

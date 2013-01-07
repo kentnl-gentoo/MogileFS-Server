@@ -82,6 +82,31 @@ ok($be->do_request("test", {}), "test ping worked");
 ok(!$be->do_request("test", {crash => 1}), "crash didn't");
 ok($be->do_request("test", {}), "test ping again worked");
 
+{
+    my $c = IO::Socket::INET->new(PeerAddr => '127.0.0.1:7001', Timeout => 3);
+    $c->syswrite("!want 1 queryworker\r\n");
+    my $res1 = <$c> . <$c>;
+    like($res1, qr/Now desiring 1 children doing 'queryworker'/, "set 1 queryworker");
+
+    my $expect = "ERR no_domain No+domain+provided\r\n" x 2;
+
+    # bad domain won't return twice
+    my $cmd = "list_keys domain=\r\n";
+    $c->syswrite($cmd x 2);
+    my $r;
+    my $resp = "";
+    do {
+        $r = $c->sysread(my $buf, 500);
+        if (defined $r && $r > 0) {
+            $resp .= $buf;
+        }
+    } while ($r && length($resp) != length($expect));
+    is($resp, $expect, "response matches expected");
+
+    $c->syswrite("!want 2 queryworker\r\n");
+    my $res2 = <$c> . <$c>;
+    like($res2, qr/Now desiring 2 children doing 'queryworker'/, "restored 2 queryworkers");
+}
 
 ok($tmptrack->mogadm("domain", "add", "todie"), "created todie domain");
 ok($tmptrack->mogadm("domain", "delete", "todie"), "delete todie domain");
@@ -214,18 +239,20 @@ for (1..10) {
 
     is scalar($mogc->get_paths("file1copy")), 1, 'File is on 1 device';
 
-    $mogc->update_class('2copies');
+    ok($mogc->update_class('file1copy', '2copies'), "updated class to 2 copies");
 
     # wait for it to replicate
     ok(try_for(10, sub {
         my @urls = $mogc->get_paths("file1copy");
         my $nloc = @urls;
-        if ($nloc < 1) {
+        if ($nloc < 2) {
             diag("no_content still only on $nloc devices");
             return 0;
         }
         return 1;
     }), "replicated to 2 paths");
+
+    ok($mogc->update_class('file1copy', 'default'), "updated class to default");
 
     ok($mogc->delete("file1copy"), "deleted updateclass testfile file1copy")
         or die "Error: " . $mogc->errstr;
@@ -367,13 +394,31 @@ foreach my $t (qw(file file_on file_to_delete)) {
     is($info->{fid}, $opts->{fid}, "explicit fid is correctly set");
 }
 
-sub try_for {
-    my ($tries, $code) = @_;
-    for (1..$tries) {
-        return 1 if $code->();
-        sleep 1;
-    }
-    return 0;
+{
+    my $fh = $mogc->new_file("0", "1copy");
+    ok((print $fh "zero\n"), "wrote to file");
+    ok(close($fh), "closed file");
+
+    my $info = $mogc->file_info("0");
+    is("HASH", ref($info), "file_info returned a hash");
+    is("0", $info->{key}, "key matches 0");
+    is("1copy", $info->{class}, "class matches for 0 key");
+
+    my @paths = $mogc->get_paths("0");
+    is(1, scalar(@paths), "path returned for 0");
+
+    $mogc->rename("0", "zero");
+    is($info->{fid}, $mogc->file_info("zero")->{fid}, "rename from 0");
+    $mogc->rename("zero", "0");
+    is($info->{fid}, $mogc->file_info("0")->{fid}, "rename to 0");
+    $mogc->update_class("0", "2copies");
+    is("2copies", $mogc->file_info("0")->{class}, "class updated for 0 key");
+
+    my $debug = $mogc->file_debug(key => "0");
+    is($debug->{fid_fid}, $info->{fid}, "FID from debug matches");
+    is($debug->{fid_dkey}, "0", "key from debug matches");
+
+    ok($mogc->delete("0"), "delete 0 works");
 }
 
 done_testing();
