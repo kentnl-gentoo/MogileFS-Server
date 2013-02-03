@@ -370,6 +370,7 @@ sub dbh {
             AutoCommit => 1,
             # FUTURE: will default to on (have to validate all callers first):
             RaiseError => ($self->{raise_errors} || 0),
+            sqlite_use_immediate_transaction => 1,
         });
     };
     alarm(0);
@@ -852,9 +853,27 @@ sub delete_host {
 # return true if deleted, 0 if didn't exist, exception if error
 sub delete_domain {
     my ($self, $dmid) = @_;
-    throw("has_files")   if $self->domain_has_files($dmid);
-    throw("has_classes") if $self->domain_has_classes($dmid);
-    return $self->dbh->do("DELETE FROM domain WHERE dmid = ?", undef, $dmid);
+    my ($err, $rv);
+    my $dbh = $self->dbh;
+    eval {
+        $dbh->begin_work;
+        if ($self->domain_has_files($dmid)) {
+            $err = "has_files";
+        } elsif ($self->domain_has_classes($dmid)) {
+            $err = "has_classes";
+        } else {
+            $rv = $dbh->do("DELETE FROM domain WHERE dmid = ?", undef, $dmid);
+
+            # remove the "default" class if one was created (for mindevcount)
+            # this is currently the only way to delete the "default" class
+            $dbh->do("DELETE FROM class WHERE dmid = ? AND classid = 0", undef, $dmid);
+            $dbh->commit;
+        }
+	$dbh->rollback if $err;
+    };
+    $self->condthrow; # will rollback on errors
+    throw($err) if $err;
+    return $rv;
 }
 
 sub domain_has_files {
@@ -866,9 +885,11 @@ sub domain_has_files {
 
 sub domain_has_classes {
     my ($self, $dmid) = @_;
-    my $has_a_class = $self->dbh->selectrow_array('SELECT classid FROM class WHERE dmid = ? LIMIT 1',
+    # queryworker does not permit removing default class, so domain_has_classes
+    # should not register the default class
+    my $has_a_class = $self->dbh->selectrow_array('SELECT classid FROM class WHERE dmid = ? AND classid != 0 LIMIT 1',
         undef, $dmid);
-    return $has_a_class ? 1 : 0;
+    return defined($has_a_class);
 }
 
 sub class_has_files {
@@ -880,32 +901,36 @@ sub class_has_files {
 
 # return new classid on success (non-zero integer), die on failure
 # throw 'dup' on duplicate name
-# override this if you want a less racy version.
 sub create_class {
     my ($self, $dmid, $classname) = @_;
     my $dbh = $self->dbh;
 
-    # get the max class id in this domain
-    my $maxid = $dbh->selectrow_array
-        ('SELECT MAX(classid) FROM class WHERE dmid = ?', undef, $dmid) || 0;
+    my ($clsid, $rv);
 
-    my $clsid = $maxid + 1;
-    if ($classname eq 'default') {
-        $clsid = 0;
-    }
-
-    # now insert the new class
-    my $rv = eval {
-        $dbh->do("INSERT INTO class (dmid, classid, classname, mindevcount) VALUES (?, ?, ?, ?)",
-                 undef, $dmid, $clsid, $classname, 2);
+    eval {
+        $dbh->begin_work;
+        if ($classname eq 'default') {
+            $clsid = 0;
+        } else {
+            # get the max class id in this domain
+            my $maxid = $dbh->selectrow_array
+                ('SELECT MAX(classid) FROM class WHERE dmid = ?', undef, $dmid) || 0;
+            $clsid = $maxid + 1;
+        }
+        # now insert the new class
+        $rv = $dbh->do("INSERT INTO class (dmid, classid, classname, mindevcount) VALUES (?, ?, ?, ?)",
+                       undef, $dmid, $clsid, $classname, 2);
+        $dbh->commit if $rv;
     };
     if ($@ || $dbh->err) {
         if ($self->was_duplicate_error) {
+            # ensure we're not inside a transaction
+            if ($dbh->{AutoCommit} == 0) { eval { $dbh->rollback }; }
             throw("dup");
         }
     }
+    $self->condthrow; # this will rollback on errors
     return $clsid if $rv;
-    $self->condthrow;
     die;
 }
 
@@ -1239,15 +1264,23 @@ sub delete_class {
     $self->condthrow;
 }
 
+# called from a queryworker process, will trigger delete_fidid_enqueued
+# in the delete worker
 sub delete_fidid {
+    my ($self, $fidid) = @_;
+    eval { $self->dbh->do("DELETE FROM file WHERE fid=?", undef, $fidid); };
+    $self->condthrow;
+    $self->enqueue_for_delete2($fidid, 0);
+    $self->condthrow;
+}
+
+# Only called from delete workers (after delete_fidid),
+# this reduces client-visible latency from the queryworker
+sub delete_fidid_enqueued {
     my ($self, $fidid) = @_;
     eval { $self->delete_checksum($fidid); };
     $self->condthrow;
-    eval { $self->dbh->do("DELETE FROM file WHERE fid=?", undef, $fidid); };
-    $self->condthrow;
     eval { $self->dbh->do("DELETE FROM tempfile WHERE fid=?", undef, $fidid); };
-    $self->condthrow;
-    $self->enqueue_for_delete2($fidid, 0);
     $self->condthrow;
 }
 

@@ -84,9 +84,7 @@ ok($be->do_request("test", {}), "test ping again worked");
 
 {
     my $c = IO::Socket::INET->new(PeerAddr => '127.0.0.1:7001', Timeout => 3);
-    $c->syswrite("!want 1 queryworker\r\n");
-    my $res1 = <$c> . <$c>;
-    like($res1, qr/Now desiring 1 children doing 'queryworker'/, "set 1 queryworker");
+    ok(want($c, 1, "queryworker"), "set 1 queryworker");
 
     my $expect = "ERR no_domain No+domain+provided\r\n" x 2;
 
@@ -103,14 +101,35 @@ ok($be->do_request("test", {}), "test ping again worked");
     } while ($r && length($resp) != length($expect));
     is($resp, $expect, "response matches expected");
 
-    $c->syswrite("!want 2 queryworker\r\n");
-    my $res2 = <$c> . <$c>;
-    like($res2, qr/Now desiring 2 children doing 'queryworker'/, "restored 2 queryworkers");
+    ok(want($c, 2, "queryworker"), "restored 2 queryworkers");
 }
 
 ok($tmptrack->mogadm("domain", "add", "todie"), "created todie domain");
 ok($tmptrack->mogadm("domain", "delete", "todie"), "delete todie domain");
 ok(!$tmptrack->mogadm("domain", "delete", "todie"), "didn't delete todie domain again");
+
+# ensure "default" class is removed when its domain is removed
+{
+    use Data::Dumper;
+    my $before = Dumper($sto->get_all_classes);
+    ok($tmptrack->mogadm("domain", "add", "def"), "created def domain");
+
+    my $dmid = $sto->get_domainid_by_name("def");
+    ok(defined($dmid), "def dmid retrieved");
+
+    isnt($sto->domain_has_classes($dmid), "domain_has_classes does not show default class");
+    ok($tmptrack->mogadm("class", "modify", "def", "default", "--mindevcount=3"), "modified default to have mindevcount=3");
+
+    my $classid = $sto->get_classid_by_name($dmid, "default");
+    is($classid, 0, "default class has classid=0");
+    isnt($sto->domain_has_classes($dmid), "domain_has_classes does not show default class");
+    ok($tmptrack->mogadm("domain", "delete", "def"), "remove def domain");
+    is($sto->get_domainid_by_name("def"), undef, "def nonexistent");
+    is($sto->get_classid_by_name($dmid, "default"), undef, "def/default class nonexistent");
+
+    my $after = Dumper($sto->get_all_classes);
+    is($after, $before, "class listing is unchanged");
+}
 
 ok($tmptrack->mogadm("domain", "add", "hasclass"), "created hasclass domain");
 ok($tmptrack->mogadm("class", "add", "hasclass", "nodel"), "created nodel class");
@@ -419,6 +438,19 @@ foreach my $t (qw(file file_on file_to_delete)) {
     is($debug->{fid_dkey}, "0", "key from debug matches");
 
     ok($mogc->delete("0"), "delete 0 works");
+}
+
+# ensure all workers can be stopped/started
+{
+    my $c = IO::Socket::INET->new(PeerAddr => '127.0.0.1:7001', Timeout => 3);
+    my @jobs = qw(fsck queryworker delete replicate reaper monitor job_master);
+
+    foreach my $j (@jobs) {
+      ok(want($c, 0, $j), "shut down all $j");
+    }
+    foreach my $j (@jobs) {
+      ok(want($c, 1, $j), "start 1 $j");
+    }
 }
 
 done_testing();

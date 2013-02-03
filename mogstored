@@ -23,6 +23,7 @@ use Mogstored::HTTPServer::Perlbal;
 use Mogstored::HTTPServer::Lighttpd;
 use Mogstored::HTTPServer::None;
 use Mogstored::HTTPServer::Apache;
+use Mogstored::HTTPServer::Nginx;
 use Mogstored::SideChannelListener;
 use Mogstored::SideChannelClient;
 
@@ -68,8 +69,8 @@ my %config_opts = (
                    );
 usage() unless Getopt::Long::GetOptions(%config_opts);
 
-die "Unknown server type.  Valid options: --server={perlbal,lighttpd,apache,none}"
-    unless $server =~ /^perlbal|lighttpd|apache|none$/;
+die "Unknown server type.  Valid options: --server={perlbal,lighttpd,apache,nginx,none}"
+    unless $server =~ /^perlbal|lighttpd|apache|nginx|none$/;
 
 $opt_config = $default_config if ! $opt_config && -e $default_config;
 load_config_file($opt_config => \%config_opts) if $opt_config && !$opt_skipconfig;
@@ -96,7 +97,13 @@ my $httpsrv       = $httpsrv_class->new(
                                         maxconns => $max_conns,
                                         bin      => $serverbin,
                                         );
-$httpsrv->start;
+
+# Configure Perlbal HTTP listener after daemonization since it can create a
+# kqueue on *BSD.  kqueue descriptors are automatically invalidated on fork(),
+# making them unusable after daemonize.  For non-Perlbal, starting the
+# server before daemonization improves error reporting as daemonization
+# redirects stdout/stderr to /dev/null.
+$httpsrv->start if $server ne "perlbal";
 
 if ($opt_daemonize) {
     $httpsrv->pre_daemonize;
@@ -104,6 +111,9 @@ if ($opt_daemonize) {
 } else {
     print "Running.\n";
 }
+
+# It is now safe for Perlbal to create a kqueue
+$httpsrv->start if $server eq "perlbal";
 
 $httpsrv->post_daemonize;
 

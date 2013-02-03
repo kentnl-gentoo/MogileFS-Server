@@ -236,6 +236,9 @@ sub make_new_child {
         return $worker_conn;
     }
 
+    # let children have different random number seeds
+    srand();
+
     # as a child, we want to close these and ignore them
     $_->() foreach @prefork_cleanup;
     close($parents_ipc);
@@ -554,7 +557,7 @@ sub ProcessQueues {
         next unless $clref;
 
         # get worker and make sure it's not closed already
-        my MogileFS::Connection::Worker $worker = shift @IdleQueryWorkers;
+        my MogileFS::Connection::Worker $worker = pop @IdleQueryWorkers;
         if (!defined $worker || $worker->{closed}) {
             unshift @PendingQueries, $clref;
             next;
