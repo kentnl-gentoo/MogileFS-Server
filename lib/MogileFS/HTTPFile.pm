@@ -149,6 +149,18 @@ sub digest_mgmt {
     my $rv;
     my $expiry;
 
+    # assuming the storage node can checksum at >=2MB/s, low expectations here
+    my $response_timeout = $self->size / (2 * 1024 * 1024);
+    if ($reason && $reason eq "fsck") {
+        # fsck has low priority in mogstored and is concurrency-limited,
+        # so this may be queued indefinitely behind digest requests for
+        # large files
+        $response_timeout += 3600;
+    } else {
+        # account for disk/network latency:
+        $response_timeout += $node_timeout;
+    }
+
     $reason = defined($reason) ? " $reason" : "";
     my $uri = $self->{uri};
     my $req = "$alg $uri$reason\r\n";
@@ -158,8 +170,6 @@ sub digest_mgmt {
     # after sending a request
     my $retries = 2;
 
-    # assuming the storage node can checksum at >=2MB/s, low expectations here
-    my $response_timeout = $self->size / (2 * 1024 * 1024);
     my $host = $self->{host};
 
 retry:
@@ -204,19 +214,20 @@ retry:
     } elsif ($rv =~ /^\Q$uri\E \Q$alg\E=([a-f0-9]{32,128})\r\n/) {
         my $hexdigest = $1;
 
-        if ($hexdigest eq FILE_MISSING) {
-            # FIXME, this could be another error like EMFILE/ENFILE
-            return FILE_MISSING;
-        }
         my $checksum = eval {
             MogileFS::Checksum->from_string(0, "$alg:$hexdigest")
         };
         return undeferr("$alg failed for $uri: $@") if $@;
         return $checksum->{checksum};
+    } elsif ($rv =~ /^\Q$uri\E \Q$alg\E=-1\r\n/) {
+        # FIXME, this could be another error like EMFILE/ENFILE
+        return FILE_MISSING;
     } elsif ($rv =~ /^ERROR /) {
         return; # old server, fallback to HTTP
     }
-    return undeferr("mogstored failed to handle ($alg $uri)");
+
+    chomp($rv);
+    return undeferr("mogstored failed to handle ($alg $uri): $rv");
 }
 
 sub digest_http {

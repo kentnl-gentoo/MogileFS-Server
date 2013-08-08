@@ -347,8 +347,10 @@ sub dbh {
         if ($self->{recheck_done_gen} != $self->{recheck_req_gen}) {
             $self->{dbh} = undef unless $self->{dbh}->ping;
             # Handles a memory leak under Solaris/Postgres.
+            # We may leak a little extra memory if we're holding a lock,
+            # since dropping a connection mid-lock is fatal
             $self->{dbh} = undef if ($self->{max_handles} &&
-                $self->{handles_left}-- < 0);
+                $self->{handles_left}-- < 0 && !$self->{lock_depth});
             $self->{recheck_done_gen} = $self->{recheck_req_gen};
         }
         return $self->{dbh} if $self->{dbh};
@@ -360,6 +362,11 @@ sub dbh {
     if (!$self->is_slave) {
         my $flag = MogileFS::Config->server_setting_cached('_master_db_alive', 0);
         return if (defined $flag && $flag == 0);;
+    }
+
+    # auto-reconnect is unsafe if we're holding a lock
+    if ($self->{lock_depth}) {
+        die "DB connection recovery unsafe, lock held: $self->{last_lock}";
     }
 
     eval {
@@ -1888,6 +1895,10 @@ sub get_keys_like {
     # fix the input... prefix always ends with a % so that it works
     # in a LIKE call, and after is either blank or something
     $prefix = '' unless defined $prefix;
+
+    # escape underscores, % and \
+    $prefix =~ s/([%\\_])/\\$1/g;
+
     $prefix .= '%';
     $after  = '' unless defined $after;
 
@@ -1895,8 +1906,8 @@ sub get_keys_like {
 
     # now select out our keys
     return $self->dbh->selectcol_arrayref
-        ("SELECT dkey FROM file WHERE dmid = ? AND dkey $like ? AND dkey > ? " .
-         "ORDER BY dkey LIMIT $limit", undef, $dmid, $prefix, $after);
+        ("SELECT dkey FROM file WHERE dmid = ? AND dkey $like ? ESCAPE ? AND dkey > ? " .
+         "ORDER BY dkey LIMIT $limit", undef, $dmid, $prefix, "\\", $after);
 }
 
 sub get_keys_like_operator { return "LIKE"; }

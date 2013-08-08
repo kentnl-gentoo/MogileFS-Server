@@ -45,10 +45,6 @@ sub validate_dbh {
     return Mgd::validate_dbh();
 }
 
-sub get_dbh {
-    return Mgd::get_dbh();
-}
-
 sub monitor_has_run {
     my $self = shift;
     return $self->{monitor_has_run} ? 1 : 0;
@@ -135,7 +131,7 @@ sub read_from_parent {
     while (MogileFS::Util::wait_for_readability(fileno($psock), $timeout)) {
         $timeout = 0; # only wait on the timeout for the first read.
         my $buf;
-        my $rv = sysread($psock, $buf, 1024);
+        my $rv = sysread($psock, $buf, Mgd::UNIX_RCVBUF_SIZE());
         if (!$rv) {
             if (defined $rv) {
                 die "While reading pipe from parent, got EOF.  Parent's gone.  Quitting.\n";

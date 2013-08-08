@@ -2,7 +2,7 @@ package MogileFS::Server;
 use strict;
 use warnings;
 use vars qw($VERSION);
-$VERSION = "2.67";
+$VERSION = "2.68";
 
 =head1 NAME
 
@@ -203,6 +203,21 @@ use strict;
 use warnings;
 use MogileFS::Config;
 use MogileFS::Util qw(error fatal debug); # for others calling Mgd::foo()
+use Socket qw(SOL_SOCKET SO_RCVBUF AF_UNIX SOCK_STREAM PF_UNSPEC);
+BEGIN {
+    # detect the receive buffer size for Unix domain stream sockets,
+    # we assume the size is identical across all Unix domain sockets.
+    socketpair(my $s1, my $s2, AF_UNIX, SOCK_STREAM, PF_UNSPEC)
+        or die( "socketpair failed: $!" );
+
+    my $r = getsockopt($s1, SOL_SOCKET, SO_RCVBUF);
+    defined $r or die "getsockopt: $!";
+    $r = unpack('i', $r) if defined $r;
+    $r = (defined $r && $r > 0) ? $r : 8192;
+    close $s1;
+    close $s2;
+    eval 'use constant UNIX_RCVBUF_SIZE => $r';
+}
 
 sub server {
     return MogileFS::Server->server;
@@ -219,7 +234,6 @@ sub validate_dbh {
     error("Error validating master DB: $@") if $@ && $had_dbh;
     return $dbh;
 }
-sub get_dbh      { return Mgd::get_store()->dbh  }
 
 # the eventual replacement for callers asking for a dbh directly:
 # they'll ask for the current store, which is a database abstraction

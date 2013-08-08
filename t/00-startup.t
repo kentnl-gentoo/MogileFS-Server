@@ -446,11 +446,42 @@ foreach my $t (qw(file file_on file_to_delete)) {
     my @jobs = qw(fsck queryworker delete replicate reaper monitor job_master);
 
     foreach my $j (@jobs) {
-      ok(want($c, 0, $j), "shut down all $j");
+        ok(want($c, 0, $j), "shut down all $j");
     }
-    foreach my $j (@jobs) {
-      ok(want($c, 1, $j), "start 1 $j");
+
+    # spawn job_master first to ensure delete/fsck/replicate can start
+    foreach my $j (reverse @jobs) {
+        ok(want($c, 1, $j), "start 1 $j");
     }
+}
+
+# list_keys with underscore
+{
+    my $c = IO::Socket::INET->new(PeerAddr => '127.0.0.1:7001', Timeout => 3);
+
+    foreach my $k (qw(under_score under.score per%cent back\\slash)) {
+        my $fh = $mogc->new_file($k, '1copy');
+        ok($fh, "got filehandle for $k");
+        ok(close($fh), "created file $k");
+    }
+
+    # we only have one queryworker from the previous test, so no need to
+    # clear cache twice and wait on monitor after "mogadm settings set"
+    foreach my $cslk (qw(on off)) {
+        ok($tmptrack->mogadm("settings", "set", "case_sensitive_list_keys", $cslk), "case_sensitive_list_keys = $cslk");
+        ok($be->do_request("clear_cache", {}), "cleared_cache");
+        my @l = $mogc->list_keys("under_");
+        is_deeply(['under_score', [ 'under_score' ]], \@l, "list_keys handled underscore properly (case-sensitive $cslk)");
+
+        @l = $mogc->list_keys("per%");
+        is_deeply(['per%cent', [ 'per%cent' ]], \@l, "list_keys handled % properly (case-sensitive $cslk)");
+
+        @l = $mogc->list_keys("back\\");
+        is_deeply(['back\slash', [ 'back\slash' ]], \@l, "list_keys handled \\ properly (case-sensitive $cslk)");
+    }
+
+    # restore default
+    $sto->set_server_setting('case_sensitive_list_keys', undef);
 }
 
 done_testing();

@@ -7,7 +7,7 @@ use FindBin qw($Bin);
 
 use MogileFS::Server;
 use MogileFS::Util qw(error_code);
-use MogileFS::ReplicationPolicy::MultipleHosts;
+use MogileFS::ReplicationPolicy::MultipleDevices;
 use MogileFS::Test;
 
 # already good.
@@ -16,11 +16,11 @@ is(rr("min=2  h1[d1=X d2=_] h2[d3=X d4=_]"),
 
 # need to get it onto host2...
 is(rr("min=2  h1[d1=X d2=_] h2[d3=_ d4=_]"),
-   "ideal(3,4)", "need host2");
+   "ideal(2,3,4)", "any device will do");
 
 # still needs to be on host2, even though 2 copies on host1
 is(rr("min=2  h1[d1=X d2=X] h2[d3=_ d4=_]"),
-   "ideal(3,4)", "need host2, even though 2 on host1");
+   "all_good", "2 devices is enough");
 
 # anywhere will do.  (can happen on, say, rebalance)
 is(rr("min=2  h1[d1=_ d2=_] h2[d3=_ d4=_]"),
@@ -28,28 +28,28 @@ is(rr("min=2  h1[d1=_ d2=_] h2[d3=_ d4=_]"),
 
 # should desperately try d2, since host2 is down
 is(rr("min=2  h1[d1=X d2=_] h2=down[d3=_ d4=_]"),
-   "desperate(2)");
+   "ideal(2)");
 
 # should try host3, since host2 is down
 is(rr("min=2  h1[d1=X d2=_] h2=down[d3=_ d4=_] h3[d5=_ d6=_]"),
-   "ideal(5,6)");
+   "ideal(2,5,6)");
 
 # need a copy on a non-dead disk on host1
 is(rr("min=2  h1[d1=_ d2=X,dead] h2=alive[d3=X d4=_]"),
-   "ideal(1)");
+   "ideal(1,4)");
 
 # this is an ideal move, since we only have 2 unique hosts:
 is(rr("min=3 h1[d1=_ d2=X] h2[d3=X d4=_]"),
    "ideal(1,4)");
 
-# ... but if we have a 3rd host, it's gotta be there
+# ... but if we have a 3rd host, well, it could be there
 is(rr("min=3 h1[d1=_ d2=X] h2[d3=X d4=_] h3[d5=_]"),
-   "ideal(5)");
+   "ideal(1,4,5)");
 
 # ... unless that host is down, in which case it's back to 1/4,
 # but desperately
 is(rr("min=3 h1[d1=_ d2=X] h2[d3=X d4=_] h3=down[d5=_]"),
-   "desperate(1,4)");
+   "ideal(1,4)");
 
 # too good, uniq hosts > min
 is(rr("min=2 h1[d1=X d2=_] h2[d3=X d4=_] h3[d5=X]"),
@@ -120,7 +120,7 @@ sub rr {
     }
     $parse_error->() if $state =~ /\S/;
 
-    my $polclass = "MogileFS::ReplicationPolicy::MultipleHosts";
+    my $polclass = "MogileFS::ReplicationPolicy::MultipleDevices";
     my $pol = $polclass->new;
     my $rr = $pol->replicate_to(
                                 fid      => 1,

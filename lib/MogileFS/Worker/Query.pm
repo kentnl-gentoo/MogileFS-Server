@@ -59,7 +59,7 @@ sub work {
         }
 
         my $newread;
-        my $rv = sysread($psock, $newread, 1024);
+        my $rv = sysread($psock, $newread, Mgd::UNIX_RCVBUF_SIZE());
         if (!$rv) {
             if (defined $rv) {
                 die "While reading pipe from parent, got EOF.  Parent's gone.  Quitting.\n";
@@ -250,7 +250,14 @@ sub cmd_create_open {
 
     my @devices = Mgd::device_factory()->get_all;
     if ($size) {
-        @devices = grep { ($_->mb_free * 1024*1024) > $size } @devices;
+        # We first ignore all the devices with an unknown space free.
+        @devices = grep { length($_->mb_free) && ($_->mb_free * 1024*1024) > $size } @devices;
+
+        # If we didn't find any, try all the devices with an unknown space free.
+        # This may happen if mogstored isn't running.
+        if (!@devices) {
+            @devices = grep { !length($_->mb_free) } Mgd::device_factory()->get_all;
+        }
     }
 
     unless (MogileFS::run_global_hook('cmd_create_open_order_devices', [ @devices ], \@devices)) {
@@ -716,13 +723,6 @@ sub cmd_list_keys {
         # now validate that after matches prefix
         return $self->err_line('after_mismatch')
             if $after && $after !~ /^$prefix/;
-
-        # verify there are no % or \ characters
-        return $self->err_line('invalid_chars')
-            if $prefix =~ /[%\\]/;
-
-        # escape underscores
-        $prefix =~ s/_/\\_/g;
     }
 
     $limit ||= 1000;
@@ -1772,7 +1772,6 @@ sub err_line {
         'host_mismatch' => "The device specified doesn't belong to the host specified",
         'host_not_empty' => "Unable to delete host; it contains devices still",
         'host_not_found' => "Host not found",
-        'invalid_chars' => "Patterns must not contain backslashes (\\) or percent signs (%).",
         'invalid_checker_level' => "Checker level invalid.  Please see documentation on this command.",
         'invalid_mindevcount' => "The mindevcount must be at least 1",
         'key_exists' => "Target key name already exists; can't overwrite.",
