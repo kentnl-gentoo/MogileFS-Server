@@ -2,7 +2,7 @@ package MogileFS::Server;
 use strict;
 use warnings;
 use vars qw($VERSION);
-$VERSION = "2.68";
+$VERSION = "2.70";
 
 =head1 NAME
 
@@ -25,7 +25,6 @@ use File::Path ();
 use Sys::Syslog ();
 use Time::HiRes ();
 use Net::Netmask;
-use LWP::UserAgent;
 use List::Util;
 use Socket qw(SO_KEEPALIVE IPPROTO_TCP TCP_NODELAY);
 

@@ -2,16 +2,9 @@ package MogileFS::HTTPFile;
 use strict;
 use warnings;
 use Carp qw(croak);
-use Socket qw(PF_INET IPPROTO_TCP SOCK_STREAM);
 use Digest;
 use MogileFS::Server;
 use MogileFS::Util qw(error undeferr wait_for_readability wait_for_writeability);
-
-# (caching the connection used for HEAD requests)
-my $user_agent;
-
-my %size_check_retry_after; # host => $hirestime.
-my %size_check_failcount;   # host => $count.
 
 my %sidechannel_nexterr;    # host => next error log time
 
@@ -62,58 +55,61 @@ sub delete {
     my $self = shift;
     my %opts = @_;
     my ($host, $port) = ($self->{host}, $self->{port});
+    my %http_opts = ( port => $port );
+    my $res;
 
-    my $httpsock = IO::Socket::INET->new(PeerAddr => $host, PeerPort => $port, Timeout => 2)
-        or die "can't connect to $host:$port in 2 seconds";
+    $self->host->http("DELETE", $self->{uri}, \%http_opts, sub { ($res) = @_ });
 
-    $httpsock->write("DELETE $self->{uri} HTTP/1.0\r\nConnection: keep-alive\r\n\r\n");
+    Danga::Socket->SetPostLoopCallback(sub { !defined $res });
+    Danga::Socket->EventLoop;
 
-    my $keep_alive = 0;
-    my $did_del    = 0;
-
-    while (defined (my $line = <$httpsock>)) {
-        $line =~ s/[\s\r\n]+$//;
-        last unless length $line;
-        if ($line =~ m!^HTTP/\d+\.\d+\s+(\d+)!) {
-            my $rescode = $1;
-            # make sure we get a good response
-            if ($rescode == 404 && $opts{ignore_missing}) {
-                $did_del = 1;
-                next;
-            }
-            unless ($rescode == 204) {
-                die "Bad response from $host:$port: [$line]";
-            }
-            $did_del = 1;
-            next;
-        }
-        die "Unexpected HTTP response line during DELETE from $host:$port: [$line]" unless $did_del;
+    if ($res->code == 204 || ($res->code == 404 && $opts{ignore_missing})) {
+        return 1;
     }
-    die "Didn't get valid HTTP response during DELETE from $host:port" unless $did_del;
-
-    return 1;
+    my $line = $res->status_line;
+    die "Bad response on DELETE $self->{url}: [$line]";
 }
 
 # returns size of file, (doing a HEAD request and looking at content-length)
 # returns -1 on file missing (404),
 # returns undef on connectivity error
+#
+# If an optional callback is supplied, the return value is given to the
+# callback.
+#
+# workers running Danga::Socket->EventLoop must supply a callback
+# workers NOT running Danga::Socket->EventLoop msut not supply a callback
 use constant FILE_MISSING => -1;
 sub size {
-    my $self = shift;
+    my ($self, $cb) = @_;
+    my %opts = ( port => $self->{port} );
 
-    return $self->{_size} if defined $self->{_size};
+    if ($cb) { # run asynchronously
+        if (defined $self->{_size}) {
+            Danga::Socket->AddTimer(0, sub { $cb->($self->{_size}) });
+        } else {
+            $self->host->http("HEAD", $self->{uri}, \%opts, sub {
+                $cb->($self->on_size_response(@_));
+            });
+        }
+        return undef;
+    } else { # run synchronously
+        return $self->{_size} if defined $self->{_size};
 
-    my ($host, $port, $uri, $path) = map { $self->{$_} } qw(host port uri url);
+        my $res;
+        $self->host->http("HEAD", $self->{uri}, \%opts, sub { ($res) = @_ });
 
-    return undef if (exists $size_check_retry_after{$host}
-        && $size_check_retry_after{$host} > Time::HiRes::time());
+        Danga::Socket->SetPostLoopCallback(sub { !defined $res });
+        Danga::Socket->EventLoop;
 
-    my $node_timeout = MogileFS->config("node_timeout");
-    # Hardcoded connection cache size of 20 :(
-    $user_agent ||= LWP::UserAgent->new(timeout => $node_timeout, keep_alive => 20);
-    my $res = $user_agent->head($path);
+        return $self->on_size_response($res);
+    }
+}
+
+sub on_size_response {
+    my ($self, $res) = @_;
+
     if ($res->is_success) {
-        delete $size_check_failcount{$host} if exists $size_check_failcount{$host};
         my $size = $res->header('content-length');
         if (! defined $size &&
             $res->header('server') =~ m/^lighttpd/) {
@@ -126,17 +122,9 @@ sub size {
         return $size;
     } else {
         if ($res->code == 404) {
-            delete $size_check_failcount{$host} if exists $size_check_failcount{$host};
             return FILE_MISSING;
         }
-        if ($res->message =~ m/connect:/) {
-            my $count = $size_check_failcount{$host};
-            $count ||= 1;
-            $count *= 2 unless $count > 360;
-            $size_check_retry_after{$host} = Time::HiRes::time() + $count;
-            $size_check_failcount{$host}   = $count;
-        }
-        return undeferr("Failed HEAD check for $path (" . $res->code . "): "
+        return undeferr("Failed HEAD check for $self->{url} (" . $res->code . "): "
             . $res->message); 
     }
 }
@@ -233,27 +221,27 @@ retry:
 sub digest_http {
     my ($self, $alg, $ping_cb) = @_;
 
-    # TODO: refactor
-    my $node_timeout = MogileFS->config("node_timeout");
-    # Hardcoded connection cache size of 20 :(
-    $user_agent ||= LWP::UserAgent->new(timeout => $node_timeout, keep_alive => 20);
     my $digest = Digest->new($alg);
-
     my %opts = (
+        port => $self->{port},
         # default (4K) is tiny, use 1M like replicate
-        ':read_size_hint' => 0x100000,
-        ':content_cb' => sub {
+        read_size_hint => 0x100000,
+        content_cb => sub {
             $digest->add($_[0]);
             $ping_cb->();
-        }
+        },
     );
 
-    my $path = $self->{url};
-    my $res = $user_agent->get($path, %opts);
+    my $res;
+    $self->host->http("GET", $self->{uri}, \%opts, sub { ($res) = @_ });
+
+    # TODO: async interface for workers already running Danga::Socket->EventLoop
+    Danga::Socket->SetPostLoopCallback(sub { !defined $res });
+    Danga::Socket->EventLoop;
 
     return $digest->digest if $res->is_success;
     return FILE_MISSING if $res->code == 404;
-    return undeferr("Failed $alg (GET) check for $path (" . $res->code . "): "
+    return undeferr("Failed $alg (GET) check for $self->{url} (" . $res->code . "): "
                     . $res->message);
 }
 

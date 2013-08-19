@@ -5,6 +5,9 @@ use MogileFS::Util qw(throw);
 use Net::Netmask;
 use Carp qw(croak);
 use MogileFS::Connection::Mogstored;
+use MogileFS::Connection::HTTP;
+use MogileFS::ConnectionPool;
+our $http_pool;
 
 =head1
 
@@ -98,6 +101,61 @@ sub sidechannel_port {
     # TODO: let this be configurable per-host?  currently it's configured
     # once for all machines.
     MogileFS->config("mogstored_stream_port");
+}
+
+# starts an HTTP request on the given $port with $method to $path
+# Calls cb with an HTTP::Response object when done
+sub _http_conn {
+    my ($self, $port, $method, $path, $opts, $cb) = @_;
+    _init_pools();
+
+    $http_pool->start($opts->{ip} || $self->ip, $port, sub {
+        $_[0]->start($method, $path, $opts, $cb);
+    });
+}
+
+# Returns a ready, blocking HTTP connection
+# This is only used by replicate
+sub http_conn_get {
+    my ($self, $opts) = @_;
+    my $ip = $opts->{ip} || $self->ip;
+    my $port = $opts->{port} || $self->http_port;
+
+    _init_pools();
+    my $conn = $http_pool->conn_get($ip, $port);
+    $conn->sock->blocking(1) if $conn;
+    return $conn;
+}
+
+# Returns a blocking HTTP connection back to the pool.
+# This is the inverse of http_conn_get, and should be called when
+# done using a connection (iff the connection is really still alive)
+# (and makes it non-blocking for future use)
+# This is only used by replicate.
+sub http_conn_put {
+    my ($self, $conn) = @_;
+    $conn->sock->blocking(0);
+    $http_pool->conn_put($conn);
+}
+
+sub http_get {
+    my ($self, $method, $path, $opts, $cb) = @_;
+    $opts ||= {};
+    $self->_http_conn($self->http_get_port, $method, $path, $opts, $cb);
+}
+
+sub http {
+    my ($self, $method, $path, $opts, $cb) = @_;
+    $opts ||= {};
+    my $port = delete $opts->{port} || $self->http_port;
+    $self->_http_conn($port, $method, $path, $opts, $cb);
+}
+
+# FIXME - make these customizable
+sub _init_pools {
+    return if $http_pool;
+
+    $http_pool = MogileFS::ConnectionPool->new("MogileFS::Connection::HTTP");
 }
 
 1;
