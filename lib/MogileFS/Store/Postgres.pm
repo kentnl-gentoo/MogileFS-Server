@@ -292,6 +292,13 @@ sub upgrade_add_device_drain {
     }
 }
 
+sub upgrade_add_host_readonly {
+    my $self = shift;
+    unless ($self->column_constraint("host", "status") =~ /\breadonly\b/) {
+        $self->dowell("ALTER TABLE host MODIFY COLUMN status VARCHAR(8) CHECK(status IN ('alive', 'dead', 'down', 'readonly'))");
+    }
+}
+
 sub upgrade_modify_server_settings_value {
     my $self = shift;
     unless ($self->column_type("server_settings", "value" =~ /text/i)) {
@@ -692,20 +699,6 @@ sub create_device {
     $self->condthrow;
     die "error making device $devid\n" unless $rv > 0;
     return 1;
-}
-
-sub mark_fidid_unreachable {
-    my ($self, $fidid) = @_;
-    my $dbh = $self->dbh;
-
-    eval {
-        $self->insert_or_update(
-            insert => "INSERT INTO unreachable_fids (fid, lastupdate) VALUES (?, ".$self->unix_timestamp.")",
-            insert_vals => [ $fidid ],
-            update => "UPDATE unreachable_fids SET lastupdate = ".$self->unix_timestamp." WHERE field = ?",
-            update_vals => [ $fidid ],
-        );
-    };
 }
 
 sub replace_into_file {

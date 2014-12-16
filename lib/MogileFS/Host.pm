@@ -36,7 +36,7 @@ sub new_from_args {
 
 sub valid_state {
     my ($class, $state) = @_;
-    return $state && $state =~ /\A(?:alive|dead|down)\z/;
+    return $state && $state =~ /\A(?:alive|dead|down|readonly)\z/;
 }
 
 # Instance methods:
@@ -75,6 +75,14 @@ sub observed_fields {
 
 sub alive {
     return $_[0]->status eq 'alive';
+}
+
+sub readonly {
+    return $_[0]->status eq 'readonly';
+}
+
+sub should_read_from {
+    return $_[0]->alive || $_[0]->readonly;
 }
 
 sub observed_reachable {
@@ -154,8 +162,11 @@ sub http {
 # FIXME - make these customizable
 sub _init_pools {
     return if $http_pool;
+    my $opts = {
+        total_capacity => MogileFS->config("conn_pool_size"),
+    };
 
-    $http_pool = MogileFS::ConnectionPool->new("MogileFS::Connection::HTTP");
+    $http_pool = MogileFS::ConnectionPool->new("MogileFS::Connection::HTTP", $opts);
 }
 
 1;

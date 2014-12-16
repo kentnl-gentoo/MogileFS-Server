@@ -396,6 +396,13 @@ sub upgrade_modify_device_size {
     }
 }
 
+sub upgrade_add_host_readonly {
+    my $self = shift;
+    unless ($self->column_type("host", "status") =~ /\breadonly\b/) {
+        $self->dowell("ALTER TABLE host MODIFY COLUMN status ENUM('alive', 'dead', 'down', 'readonly')");
+    }
+}
+
 sub pre_daemonize_checks {
     my $self = shift;
     # Jay Buffington, from the mailing lists, writes:
@@ -435,6 +442,31 @@ sub pre_daemonize_checks {
 sub get_keys_like_operator {
     my $bool = MogileFS::Config->server_setting_cached('case_sensitive_list_keys');
     return $bool ? "LIKE /*! BINARY */" : "LIKE";
+}
+
+sub update_device_usages {
+    my ($self, $updates, $cb) = @_;
+    $cb->();
+    my $chunk = 10000; # in case we hit max_allowed_packet size(!)
+    while (scalar @$updates) {
+        my @cur = splice(@$updates, 0, $chunk);
+        my @set;
+        foreach my $fld (qw(mb_total mb_used mb_asof)) {
+            my $s = "$fld = CASE devid\n";
+            foreach my $upd (@cur) {
+                my $devid = $upd->{devid};
+                defined($devid) or croak("devid not set\n");
+                my $val = $upd->{$fld};
+                defined($val) or croak("$fld not defined for $devid\n");
+                $s .= "WHEN $devid THEN $val\n";
+            }
+            $s .= "ELSE $fld END";
+            push @set, $s;
+        }
+        my $sql = "UPDATE device SET ". join(",\n", @set);
+        $self->dowell($sql);
+        $cb->();
+    }
 }
 
 1;

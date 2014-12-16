@@ -20,7 +20,8 @@ use List::Util qw(shuffle);
 #     also adds a TEXT 'arg' column to file_to_queue for passing arguments
 # 14: modifies 'device' mb_total, mb_used to INT for devs > 16TB
 # 15: adds checksum table, adds 'hashtype' column to 'class' table
-use constant SCHEMA_VERSION => 15;
+# 16: adds 'readonly' state to enum in host table
+use constant SCHEMA_VERSION => 16;
 
 sub new {
     my ($class) = @_;
@@ -1218,12 +1219,24 @@ sub update_device {
 
 sub update_device_usage {
     my $self = shift;
-    my %arg  = $self->_valid_params([qw(mb_total mb_used devid)], @_);
+    my %arg = $self->_valid_params([qw(mb_total mb_used devid mb_asof)], @_);
     eval {
-        $self->dbh->do("UPDATE device SET mb_total = ?, mb_used = ?, mb_asof = " . $self->unix_timestamp .
-                       " WHERE devid = ?", undef, $arg{mb_total}, $arg{mb_used}, $arg{devid});
+        $self->dbh->do("UPDATE device SET ".
+                       "mb_total = ?, mb_used = ?, mb_asof = ?" .
+                       " WHERE devid = ?",
+                       undef, $arg{mb_total}, $arg{mb_used}, $arg{mb_asof},
+                       $arg{devid});
     };
     $self->condthrow;
+}
+
+# MySQL has an optimized version
+sub update_device_usages {
+    my ($self, $updates, $cb) = @_;
+    foreach my $upd (@$updates) {
+        $self->update_device_usage(%$upd);
+        $cb->();
+    }
 }
 
 # This is unimplemented at the moment as we must verify:
@@ -1237,13 +1250,6 @@ sub update_device_usage {
 # cluster to implode.
 sub delete_device {
     die "Unimplemented; needs further testing";
-}
-
-sub mark_fidid_unreachable {
-    my ($self, $fidid) = @_;
-    die "Your database does not support REPLACE! Reimplement mark_fidid_unreachable!" unless $self->can_replace;
-    $self->dbh->do("REPLACE INTO unreachable_fids VALUES (?, " . $self->unix_timestamp . ")",
-                   undef, $fidid);
 }
 
 sub set_device_weight {
@@ -1661,14 +1667,6 @@ sub update_host {
         $self->dbh->do("UPDATE host SET " . join('=?, ', @keys)
             . "=? WHERE hostid=?", undef, (map { $to_update->{$_} } @keys),
             $hid);
-    });
-    return 1;
-}
-
-sub update_host_property {
-    my ($self, $hostid, $col, $val) = @_;
-    $self->conddup(sub {
-        $self->dbh->do("UPDATE host SET $col=? WHERE hostid=?", undef, $val, $hostid);
     });
     return 1;
 }
