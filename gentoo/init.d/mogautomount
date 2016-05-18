@@ -1,4 +1,4 @@
-#!/sbin/runscript
+#!/sbin/openrc-run
 
 NAME="mogautomount"
 BINARY="/usr/bin/mogautomount"
