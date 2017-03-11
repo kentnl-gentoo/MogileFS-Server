@@ -6,7 +6,7 @@ MOGILE_UID="mogile"
 MOGILE_GID="mogile"
 
 depend() {
-	use net
+	use net logger
 	before mogilefsd
 	need mogautomount
 }
